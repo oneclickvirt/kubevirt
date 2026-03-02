@@ -135,111 +135,132 @@ _url_accessible() {
     curl -sfI --max-time 12 --retry 1 "$url" >/dev/null 2>&1
 }
 
-# 从 oneclickvirt/pve_kvm_images releases 中查找最佳匹配镜像
-# 参数: $1=搜索关键词（grep -i 模式），结果写入 IMAGE_URL
-_find_in_pve_kvm_images() {
-    local pattern="$1"
-    local api_url="https://api.github.com/repos/oneclickvirt/pve_kvm_images/releases/tags/images"
-    local api_json
-
-    _info "查询 pve_kvm_images releases..."
-    api_json=$(curl -sL --max-time 15 "$api_url" 2>/dev/null)
-    [ -z "$api_json" ] && return 1
-
-    # 从 JSON 中提取所有 .qcow2 资产名（兼容无 jq 环境）
-    local names
-    names=$(echo "$api_json" | grep -oP '"name":\s*"\K[^"]+\.qcow2' 2>/dev/null || \
-            echo "$api_json" | python3 -c \
-              "import sys,json; d=json.load(sys.stdin); [print(a['name']) for a in d.get('assets',[]) if a['name'].endswith('.qcow2')]" 2>/dev/null)
-    [ -z "$names" ] && return 1
-
-    # 优先选含 cloud 的，再按版本号从高到低排序取第一
-    local best
-    best=$(echo "$names" | grep -i "$pattern" | grep -i "cloud" | sort -V | tail -1)
-    [ -z "$best" ] && best=$(echo "$names" | grep -i "$pattern" | sort -V | tail -1)
-    [ -z "$best" ] && return 1
-
-    local base_url="https://github.com/oneclickvirt/pve_kvm_images/releases/download/images/${best}"
-    IMAGE_URL="${CDN_PREFIX}${base_url}"
-    _info "pve_kvm_images 中找到镜像：$best"
-    return 0
+# ===== 获取 oneclickvirt 组织镜像版本标识映射 =====
+# 参数: $1=标准化后的系统名，返回对应的 org 镜像版本字符串
+get_org_image_ver() {
+    local sys="$1"
+    case "$sys" in
+        ubuntu)         echo "ubuntu22" ;;
+        debian)         echo "debian12" ;;
+        debian11)       echo "debian11" ;;
+        almalinux)      echo "almalinux9" ;;
+        rockylinux)     echo "rockylinux9" ;;
+        centos)         echo "centos7" ;;
+        centos8-stream) echo "centos8-stream" ;;
+        opensuse)       echo "opensuse-leap-15" ;;
+        *)              echo "" ;;
+    esac
 }
 
-# 从 oneclickvirt/kvm_images releases 下载（已知版本映射）
-# 参数: $1=系统名（如 debian12），$2=版本 tag（如 v2.0）
+# 尝试从 oneclickvirt/pve_kvm_images 获取镜像 URL（最高优先级）
+# 直接按已知 URL 模式尝试，不依赖 GitHub API
+# 参数: $1=版本标识（如 debian12），$2=系统分类（如 debian），结果写入 IMAGE_URL
+_find_in_pve_kvm_images() {
+    local ver="$1"
+    local sys="$2"
+
+    _info "尝试 oneclickvirt/pve_kvm_images for ${ver}..."
+    local candidate_urls=(
+        "https://github.com/oneclickvirt/pve_kvm_images/releases/download/images/${ver}.qcow2"
+        "https://github.com/oneclickvirt/pve_kvm_images/releases/download/${sys}/${ver}.qcow2"
+    )
+
+    for base_url in "${candidate_urls[@]}"; do
+        _info "  尝试: ${base_url}"
+        local try_url="${CDN_PREFIX}${base_url}"
+        if _url_accessible "$try_url"; then
+            IMAGE_URL="$try_url"
+            _info "pve_kvm_images 中找到镜像 (CDN)：${base_url##*/}"
+            return 0
+        fi
+        if _url_accessible "$base_url"; then
+            IMAGE_URL="$base_url"
+            _info "pve_kvm_images 中找到镜像 (直连)：${base_url##*/}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 尝试从 oneclickvirt/kvm_images 获取镜像 URL（第二优先级）
+# release tag 与文件名均为版本标识，如 debian12/debian12.qcow2
+# 参数: $1=版本标识（如 debian12），结果写入 IMAGE_URL
 _find_in_kvm_images() {
-    local sysname="$1"
-    local ver="$2"
-    local base_url="https://github.com/oneclickvirt/kvm_images/releases/download/${ver}/${sysname}.qcow2"
+    local ver="$1"
+
+    _info "尝试 oneclickvirt/kvm_images for ${ver}..."
+    local base_url="https://github.com/oneclickvirt/kvm_images/releases/download/${ver}/${ver}.qcow2"
     local try_url="${CDN_PREFIX}${base_url}"
 
-    if _url_accessible "$try_url" || _url_accessible "$base_url"; then
+    if _url_accessible "$try_url"; then
         IMAGE_URL="$try_url"
-        _info "kvm_images ${ver} 中找到镜像：${sysname}.qcow2"
+        _info "kvm_images 中找到镜像 (CDN)：${ver}.qcow2"
+        return 0
+    fi
+    if _url_accessible "$base_url"; then
+        IMAGE_URL="$base_url"
+        _info "kvm_images 中找到镜像 (直连)：${ver}.qcow2"
         return 0
     fi
     return 1
 }
 
-# ===== 获取云镜像 URL（优先 oneclickvirt 组织镜像，不存在再用官方源） =====
+# ===== 获取云镜像 URL =====
+# 优先顺序：oneclickvirt/pve_kvm_images → oneclickvirt/kvm_images → 官方上游
 get_image_url() {
-    # 确定 IMAGE_OS 和各层备选方案
-    local pve_pattern kvm_name kvm_ver official_url
     IMAGE_URL=""
+    local official_url org_ver
 
+    # 标准化系统名，设置 IMAGE_OS 和官方上游回退 URL
     case "$SYSTEM" in
-        ubuntu|ubuntu2204|ubuntu22|ubuntu24)
+        ubuntu|ubuntu2204|ubuntu22)
             IMAGE_OS="ubuntu"
-            pve_pattern="ubuntu"
-            kvm_name="ubuntu22"; kvm_ver="v2.0"
+            SYSTEM="ubuntu"
             official_url="https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
+            ;;
+        ubuntu24|ubuntu2404)
+            IMAGE_OS="ubuntu"
+            SYSTEM="ubuntu"
+            official_url="https://cloud-images.ubuntu.com/minimal/releases/noble/release/ubuntu-24.04-minimal-cloudimg-amd64.img"
             ;;
         debian|debian12)
             IMAGE_OS="debian"
-            pve_pattern="debian-12\|debian12"
-            kvm_name="debian12"; kvm_ver="v2.0"
+            SYSTEM="debian"
             official_url="https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2"
             ;;
         debian11)
             IMAGE_OS="debian"
-            pve_pattern="debian-11\|debian11"
-            kvm_name="debian11"; kvm_ver="v2.0"
+            SYSTEM="debian11"
             official_url="https://cloud.debian.org/images/cloud/bullseye/latest/debian-11-genericcloud-amd64.qcow2"
             ;;
         almalinux|alma|almalinux9)
             IMAGE_OS="almalinux"
-            pve_pattern="alma"
-            kvm_name="almalinux8"; kvm_ver="v2.0"
+            SYSTEM="almalinux"
             official_url="https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/AlmaLinux-9-GenericCloud-latest.x86_64.qcow2"
             ;;
         rockylinux|rocky|rockylinux9)
             IMAGE_OS="rockylinux"
-            pve_pattern="rocky"
-            kvm_name="rockylinux8"; kvm_ver="v2.0"
-            official_url="https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud.latest.x86_64.qcow2"
+            SYSTEM="rockylinux"
+            official_url="https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2"
             ;;
         centos|centos7)
             IMAGE_OS="centos"
-            pve_pattern="centos"
-            kvm_name="centos7"; kvm_ver="v2.0"
+            SYSTEM="centos"
             official_url="https://cloud.centos.org/centos/7/images/CentOS-7-x86_64-GenericCloud.qcow2"
             ;;
         centos8|centos8-stream|centos-stream8)
             IMAGE_OS="centos"
-            pve_pattern="centos.*8\|centos8"
-            kvm_name="centos8-stream"; kvm_ver="v2.0"
+            SYSTEM="centos8-stream"
             official_url="https://cloud.centos.org/centos/8-stream/x86_64/images/CentOS-Stream-GenericCloud-8-latest.x86_64.qcow2"
             ;;
         centos9|centosstream9|centos-stream|centos-stream9)
             IMAGE_OS="centos"
-            pve_pattern="centos.*9\|centos9"
-            kvm_name="centos8-stream"; kvm_ver="v2.0"
+            SYSTEM="centos9-stream"
             official_url="https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2"
             ;;
         opensuse|suse|opensuse15|opensuselap|opensuse-leap)
             IMAGE_OS="opensuse"
-            pve_pattern="opensuse\|suse\|leap"
-            kvm_name="opensuse-leap-15"; kvm_ver="v1.0"
+            SYSTEM="opensuse"
             official_url="https://download.opensuse.org/distribution/leap/15.5/appliances/openSUSE-Leap-15.5-Minimal-VM.x86_64-Cloud.qcow2"
             ;;
         *)
@@ -250,31 +271,26 @@ get_image_url() {
     # 检测 CDN 可用性
     check_cdn || true
 
-    _step "解析镜像地址（优先 oneclickvirt 组织镜像）..."
+    _step "解析镜像地址（优先顺序：pve_kvm_images → kvm_images → 官方上游）..."
 
-    # 第1优先：pve_kvm_images releases（最新版本）
-    if _find_in_pve_kvm_images "$pve_pattern"; then
-        _info "使用来源：oneclickvirt/pve_kvm_images [releases]"
+    # 获取组织镜像版本标识
+    org_ver=$(get_org_image_ver "$SYSTEM")
+
+    # 第1优先：pve_kvm_images（直接按已知 URL 模式，不调用 GitHub API）
+    if [ -n "$org_ver" ] && _find_in_pve_kvm_images "$org_ver" "$IMAGE_OS"; then
+        _info "使用来源：oneclickvirt/pve_kvm_images"
         _info "镜像地址：$IMAGE_URL"
         return 0
     fi
 
-    # 第2优先：kvm_images releases（已知系统版本映射）
-    if [ -n "$kvm_name" ] && _find_in_kvm_images "$kvm_name" "$kvm_ver"; then
-        _info "使用来源：oneclickvirt/kvm_images [${kvm_ver}]"
+    # 第2优先：kvm_images（release tag 与文件名均为版本标识）
+    if [ -n "$org_ver" ] && _find_in_kvm_images "$org_ver"; then
+        _info "使用来源：oneclickvirt/kvm_images"
         _info "镜像地址：$IMAGE_URL"
         return 0
     fi
 
-    # centos8-stream 特殊备用地址
-    if [ "$IMAGE_OS" = "centos" ] && _url_accessible "https://api.ilolicon.com/centos8-stream.qcow2"; then
-        IMAGE_URL="https://api.ilolicon.com/centos8-stream.qcow2"
-        _info "使用来源：ilolicon [centos8-stream]"
-        _info "镜像地址：$IMAGE_URL"
-        return 0
-    fi
-
-    # 最终回退：官方上游地址
+    # 最终回退：官方上游地址（兜底）
     _warn "oneclickvirt 镜像源均不可用，回退到官方上游地址"
     IMAGE_URL="$official_url"
     _info "使用来源：官方上游"

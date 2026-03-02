@@ -55,22 +55,16 @@ chmod +x onevm.sh
 
 | 系统标识 | 说明 | 镜像来源 |
 |----------|------|----------|
-| `ubuntu` | Ubuntu 22.04 LTS | pve_kvm_images → kvm_images(ubuntu22) → 官方 |
-| `debian` | Debian 12 | pve_kvm_images → kvm_images(debian12) → 官方 |
-| `debian11` | Debian 11 | pve_kvm_images → kvm_images(debian11) → 官方 |
-| `almalinux` | AlmaLinux 9 | pve_kvm_images → kvm_images(almalinux8) → 官方 |
-| `rockylinux` | RockyLinux 9 | pve_kvm_images → kvm_images(rockylinux8) → 官方 |
-| `centos` | CentOS 7 | pve_kvm_images → kvm_images(centos7) → 官方 |
-| `centos8-stream` | CentOS Stream 8 | pve_kvm_images → kvm_images → 官方 |
-| `centos-stream` | CentOS Stream 9 | pve_kvm_images → 官方 |
-| `opensuse` | openSUSE Leap 15.5 | pve_kvm_images → kvm_images(opensuse-leap-15) → 官方 |
-
-> 镜像来源优先级：
-> 1. `oneclickvirt/pve_kvm_images` releases（最新编译版）
-> 2. `oneclickvirt/kvm_images` releases（稳定版）
-> 3. 官方上游地址（最终兜底）
->
-> 下载均支持 CDN 加速（`cdn0.spiritlhl.top` 等），网络不佳时自动检测并启用。
+| `ubuntu` | Ubuntu 22.04 LTS | pve_kvm_images(ubuntu22) → kvm_images(ubuntu22) → 官方 |
+| `ubuntu24` | Ubuntu 24.04 LTS | pve_kvm_images(ubuntu22) → kvm_images(ubuntu22) → 官方 |
+| `debian` | Debian 12 | pve_kvm_images(debian12) → kvm_images(debian12) → 官方 |
+| `debian11` | Debian 11 | pve_kvm_images(debian11) → kvm_images(debian11) → 官方 |
+| `almalinux` | AlmaLinux 9 | pve_kvm_images(almalinux9) → kvm_images(almalinux9) → 官方 |
+| `rockylinux` | RockyLinux 9 | pve_kvm_images(rockylinux9) → kvm_images(rockylinux9) → 官方 |
+| `centos` | CentOS 7 | pve_kvm_images(centos7) → kvm_images(centos7) → 官方 |
+| `centos8-stream` | CentOS Stream 8 | pve_kvm_images(centos8-stream) → kvm_images(centos8-stream) → 官方 |
+| `centos-stream` | CentOS Stream 9 | 官方上游（无组织预置镜像） |
+| `opensuse` | openSUSE Leap 15.5 | pve_kvm_images(opensuse-leap-15) → kvm_images(opensuse-leap-15) → 官方 |
 
 **示例：**
 
