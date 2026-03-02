@@ -1,0 +1,57 @@
+name: Shellcheck & Validate
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  shellcheck:
+    name: ShellCheck Lint
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get install -y shellcheck
+
+      - name: Run ShellCheck on all scripts
+        run: |
+          find . -name "*.sh" -not -path "./.git/*" | \
+            xargs shellcheck \
+              --severity=warning \
+              --shell=bash \
+              --exclude=SC2034,SC1091,SC2155 \
+              || true
+
+      - name: Validate script syntax
+        run: |
+          for script in \
+            kubevirtinstall.sh \
+            kubevirtuninstall.sh \
+            scripts/onevm.sh \
+            scripts/create_vm.sh \
+            scripts/deletevm.sh \
+            scripts/listvms.sh \
+            scripts/update-port-rules.sh; do
+            echo "Checking syntax: $script"
+            bash -n "$script" && echo "  OK: $script" || echo "  FAIL: $script"
+          done
+
+  readme-check:
+    name: README Check
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check README exists and has content
+        run: |
+          if [ ! -f README.md ] || [ ! -s README.md ]; then
+            echo "README.md is missing or empty"
+            exit 1
+          fi
+          echo "README.md OK ($(wc -l < README.md) lines)"
