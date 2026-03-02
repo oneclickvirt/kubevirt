@@ -165,28 +165,6 @@ _find_in_pve_kvm_images() {
     return 0
 }
 
-# 从 idc.wiki 镜像站查找
-_find_in_idc_wiki() {
-    local pattern="$1"
-    local index_url="https://down.idc.wiki/Image/realServer-Template/current/qcow2/"
-    local names
-
-    _info "查询 idc.wiki 镜像站..."
-    names=$(curl -sL --max-time 10 "$index_url" 2>/dev/null | \
-            grep -oP 'href="[^"]+\.qcow2"' | grep -oP '[^"/]+\.qcow2')
-    [ -z "$names" ] && return 1
-
-    local best
-    best=$(echo "$names" | grep -i "$pattern" | grep -i "cloud" | sort -V | tail -1)
-    [ -z "$best" ] && best=$(echo "$names" | grep -i "$pattern" | sort -V | tail -1)
-    [ -z "$best" ] && return 1
-
-    local base_url="${index_url}${best}"
-    IMAGE_URL="${CDN_PREFIX}${base_url}"
-    _info "idc.wiki 中找到镜像：$best"
-    return 0
-}
-
 # 从 oneclickvirt/kvm_images releases 下载（已知版本映射）
 # 参数: $1=系统名（如 debian12），$2=版本 tag（如 v2.0）
 _find_in_kvm_images() {
@@ -281,14 +259,7 @@ get_image_url() {
         return 0
     fi
 
-    # 第2优先：idc.wiki 镜像站
-    if _find_in_idc_wiki "$pve_pattern"; then
-        _info "使用来源：idc.wiki [mirror]"
-        _info "镜像地址：$IMAGE_URL"
-        return 0
-    fi
-
-    # 第3优先：kvm_images releases（已知系统版本映射）
+    # 第2优先：kvm_images releases（已知系统版本映射）
     if [ -n "$kvm_name" ] && _find_in_kvm_images "$kvm_name" "$kvm_ver"; then
         _info "使用来源：oneclickvirt/kvm_images [${kvm_ver}]"
         _info "镜像地址：$IMAGE_URL"

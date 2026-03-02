@@ -67,9 +67,8 @@ chmod +x onevm.sh
 
 > 镜像来源优先级：
 > 1. `oneclickvirt/pve_kvm_images` releases（最新编译版）
-> 2. `idc.wiki` 镜像站
-> 3. `oneclickvirt/kvm_images` releases（稳定版）
-> 4. 官方上游地址（最终兜底）
+> 2. `oneclickvirt/kvm_images` releases（稳定版）
+> 3. 官方上游地址（最终兜底）
 >
 > 下载均支持 CDN 加速（`cdn0.spiritlhl.top` 等），网络不佳时自动检测并启用。
 
