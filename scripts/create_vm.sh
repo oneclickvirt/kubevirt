@@ -31,7 +31,7 @@ check_onevm_script() {
         ONEVM_SCRIPT="./onevm.sh"
     else
         _info "正在下载 onevm.sh..."
-        wget -q https://raw.githubusercontent.com/oneclickvirt/kubevirt/main/scripts/onevm.sh -O /tmp/onevm.sh
+        curl -sSL -o /tmp/onevm.sh https://raw.githubusercontent.com/oneclickvirt/kubevirt/main/scripts/onevm.sh
         chmod +x /tmp/onevm.sh
         ONEVM_SCRIPT="/tmp/onevm.sh"
     fi

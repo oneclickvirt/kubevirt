@@ -450,7 +450,7 @@ print_summary() {
     echo "  virtctl console <name> -n kubevirt-vms  # 进入 VM 控制台"
     echo ""
     echo "开始使用："
-    echo "  wget -q https://raw.githubusercontent.com/oneclickvirt/kubevirt/main/scripts/onevm.sh"
+    echo "  curl -sSL -o onevm.sh https://raw.githubusercontent.com/oneclickvirt/kubevirt/main/scripts/onevm.sh"
     echo "  chmod +x onevm.sh"
     echo "  ./onevm.sh vm1 2 2 20 MyPass 25000 34975 35000 debian"
     echo ""

@@ -26,13 +26,13 @@
 ## 安装 KubeVirt 环境
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/oneclickvirt/kubevirt/main/kubevirtinstall.sh)
+bash <(curl -sSL https://raw.githubusercontent.com/oneclickvirt/kubevirt/main/kubevirtinstall.sh)
 ```
 
 ## 开设单个虚拟机
 
 ```bash
-wget -q https://raw.githubusercontent.com/oneclickvirt/kubevirt/main/scripts/onevm.sh
+curl -sSL -o onevm.sh https://raw.githubusercontent.com/oneclickvirt/kubevirt/main/scripts/onevm.sh
 chmod +x onevm.sh
 ./onevm.sh <name> <cpu> <memory_gb> <disk_gb> <password> <sshport> <startport> <endport> [system]
 ```
@@ -81,7 +81,7 @@ chmod +x onevm.sh
 ## 批量开设虚拟机
 
 ```bash
-wget -q https://raw.githubusercontent.com/oneclickvirt/kubevirt/main/scripts/create_vm.sh
+curl -sSL -o create_vm.sh https://raw.githubusercontent.com/oneclickvirt/kubevirt/main/scripts/create_vm.sh
 chmod +x create_vm.sh
 ./create_vm.sh
 ```
@@ -89,7 +89,7 @@ chmod +x create_vm.sh
 ## 查看所有虚拟机
 
 ```bash
-wget -q https://raw.githubusercontent.com/oneclickvirt/kubevirt/main/scripts/listvms.sh
+curl -sSL -o listvms.sh https://raw.githubusercontent.com/oneclickvirt/kubevirt/main/scripts/listvms.sh
 chmod +x listvms.sh
 ./listvms.sh
 ```
@@ -97,7 +97,7 @@ chmod +x listvms.sh
 ## 删除单个虚拟机
 
 ```bash
-wget -q https://raw.githubusercontent.com/oneclickvirt/kubevirt/main/scripts/deletevm.sh
+curl -sSL -o deletevm.sh https://raw.githubusercontent.com/oneclickvirt/kubevirt/main/scripts/deletevm.sh
 chmod +x deletevm.sh
 ./deletevm.sh <name>
 ```
@@ -105,7 +105,7 @@ chmod +x deletevm.sh
 ## 卸载（完整清理）
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/oneclickvirt/kubevirt/main/kubevirtuninstall.sh)
+bash <(curl -sSL https://raw.githubusercontent.com/oneclickvirt/kubevirt/main/kubevirtuninstall.sh)
 ```
 
 ## 日志文件

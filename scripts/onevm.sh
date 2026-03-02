@@ -80,7 +80,7 @@ check_prerequisites() {
     fi
 
     if ! command -v kubectl >/dev/null 2>&1 && ! command -v k3s >/dev/null 2>&1; then
-        _error "未找到 kubectl/k3s，请先运行安装脚本：bash <(wget -qO- .../kubevirtinstall.sh)"
+        _error "未找到 kubectl/k3s，请先运行安装脚本：bash <(curl -sSL .../kubevirtinstall.sh)"
     fi
 
     # 使用 k3s kubectl 如果没有独立 kubectl

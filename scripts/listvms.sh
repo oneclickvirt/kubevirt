@@ -62,7 +62,7 @@ list_all_vms() {
         _warn "当前没有虚拟机。"
         echo ""
         echo "使用以下命令创建虚拟机："
-        echo "  wget -q https://raw.githubusercontent.com/oneclickvirt/kubevirt/main/scripts/onevm.sh"
+        echo "  curl -sSL -o onevm.sh https://raw.githubusercontent.com/oneclickvirt/kubevirt/main/scripts/onevm.sh"
         echo "  chmod +x onevm.sh"
         echo "  ./onevm.sh vm1 2 2 20 MyPass 25000 34975 35000 debian"
         return
