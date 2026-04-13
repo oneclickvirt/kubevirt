@@ -17,7 +17,13 @@ _error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 NS="kubevirt-vms"
-RULES_FILE="/etc/kubevirt/iptables-rules"
+
+# ===== 加载防火墙库 =====
+FIREWALL_LIB="/usr/local/lib/kubevirt/firewall.sh"
+if [ ! -f "$FIREWALL_LIB" ]; then
+    _error "防火墙库未找到: $FIREWALL_LIB\n请先运行安装脚本"
+fi
+source "$FIREWALL_LIB"
 
 check_root() {
     if [ "$(id -u)" != "0" ]; then
@@ -58,67 +64,9 @@ update_vm_rules() {
         return 1
     fi
 
-    _info "更新 $vm_name 的端口转发规则（新IP: $new_ip）..."
+    _info "更新 $vm_name 的端口转发规则（新IP: $new_ip，后端：$(fw_backend_name)）..."
 
-    # 删除旧规则
-    for table in nat; do
-        for chain in PREROUTING OUTPUT POSTROUTING; do
-            local max_iter=20
-            local iter=0
-            while [ "$iter" -lt "$max_iter" ]; do
-                local rule_num
-                rule_num=$(iptables -t "$table" -L "$chain" --line-numbers -n 2>/dev/null | \
-                    grep "KUBEVIRT-VM-${vm_name}" | head -1 | awk '{print $1}' || true)
-                [ -z "$rule_num" ] && break
-                iptables -t "$table" -D "$chain" "$rule_num" 2>/dev/null || break
-                iter=$((iter + 1))
-            done
-        done
-    done
-
-    # 删除规则文件中旧条目
-    if [ -f "$RULES_FILE" ]; then
-        sed -i "/KUBEVIRT-VM-${vm_name}/d" "$RULES_FILE"
-        sed -i "/# VM: ${vm_name} /d" "$RULES_FILE"
-    fi
-
-    # 添加新规则
-    iptables -t nat -A PREROUTING \
-        -m comment --comment "KUBEVIRT-VM-${vm_name}-ssh" \
-        -p tcp --dport "$ssh_port" \
-        -j DNAT --to-destination "${new_ip}:22"
-    iptables -t nat -A OUTPUT \
-        -m comment --comment "KUBEVIRT-VM-${vm_name}-ssh-local" \
-        -p tcp --dport "$ssh_port" \
-        -j DNAT --to-destination "${new_ip}:22"
-    iptables -t nat -A POSTROUTING \
-        -m comment --comment "KUBEVIRT-VM-${vm_name}-masq" \
-        -s "${new_ip}" \
-        -j MASQUERADE
-
-    cat >> "$RULES_FILE" <<EOF
-# VM: ${vm_name} SSH
--t nat -A PREROUTING -m comment --comment "KUBEVIRT-VM-${vm_name}-ssh" -p tcp --dport ${ssh_port} -j DNAT --to-destination ${new_ip}:22
--t nat -A OUTPUT -m comment --comment "KUBEVIRT-VM-${vm_name}-ssh-local" -p tcp --dport ${ssh_port} -j DNAT --to-destination ${new_ip}:22
--t nat -A POSTROUTING -m comment --comment "KUBEVIRT-VM-${vm_name}-masq" -s ${new_ip} -j MASQUERADE
-EOF
-
-    if [ "$start_port" != "0" ] && [ "$end_port" != "0" ]; then
-        iptables -t nat -A PREROUTING \
-            -m comment --comment "KUBEVIRT-VM-${vm_name}-ports-tcp" \
-            -p tcp --dport "${start_port}:${end_port}" \
-            -j DNAT --to-destination "${new_ip}"
-        iptables -t nat -A PREROUTING \
-            -m comment --comment "KUBEVIRT-VM-${vm_name}-ports-udp" \
-            -p udp --dport "${start_port}:${end_port}" \
-            -j DNAT --to-destination "${new_ip}"
-
-        cat >> "$RULES_FILE" <<EOF
-# VM: ${vm_name} Ports ${start_port}-${end_port}
--t nat -A PREROUTING -m comment --comment "KUBEVIRT-VM-${vm_name}-ports-tcp" -p tcp --dport ${start_port}:${end_port} -j DNAT --to-destination ${new_ip}
--t nat -A PREROUTING -m comment --comment "KUBEVIRT-VM-${vm_name}-ports-udp" -p udp --dport ${start_port}:${end_port} -j DNAT --to-destination ${new_ip}
-EOF
-    fi
+    fw_add_vm "$vm_name" "$new_ip" "$ssh_port" "$start_port" "$end_port"
 
     _info "规则更新成功：$vm_name → $new_ip（SSH: $ssh_port, 端口: ${start_port}-${end_port}）"
 }

@@ -20,7 +20,13 @@ _step()  { echo -e "${BLUE}[STEP]${NC} $*"; }
 # ===== 环境变量 =====
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 NS="kubevirt-vms"
-RULES_FILE="/etc/kubevirt/iptables-rules"
+
+# ===== 加载防火墙库 =====
+FIREWALL_LIB="/usr/local/lib/kubevirt/firewall.sh"
+if [ ! -f "$FIREWALL_LIB" ]; then
+    _error "防火墙库未找到: $FIREWALL_LIB\n请先运行安装脚本"
+fi
+source "$FIREWALL_LIB"
 
 # ===== 参数解析 =====
 parse_args() {
@@ -51,6 +57,10 @@ parse_args() {
 
     # 允许 startport/endport 为 0（表示不分配额外端口）
     if [ "$START_PORT" != "0" ] || [ "$END_PORT" != "0" ]; then
+        if { [ "$START_PORT" = "0" ] && [ "$END_PORT" != "0" ]; } || \
+           { [ "$START_PORT" != "0" ] && [ "$END_PORT" = "0" ]; }; then
+            _error "起始端口和结束端口必须同时为 0 或同时非零"
+        fi
         for port in "$START_PORT" "$END_PORT"; do
             if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 0 ] || [ "$port" -gt 65535 ]; then
                 _error "端口无效：$port（必须在 0-65535 范围内，0 表示不分配）"
@@ -80,12 +90,12 @@ check_prerequisites() {
     fi
 
     if ! command -v kubectl >/dev/null 2>&1 && ! command -v k3s >/dev/null 2>&1; then
-        _error "未找到 kubectl/k3s，请先运行安装脚本：bash <(curl -sSL .../kubevirtinstall.sh)"
+        _error "未找到 kubectl/k3s，请先运行安装脚本"
     fi
 
-    # 使用 k3s kubectl 如果没有独立 kubectl
+    # 确保 kubectl 可用
     if ! command -v kubectl >/dev/null 2>&1; then
-        alias kubectl='k3s kubectl'
+        kubectl() { k3s kubectl "$@"; }
     fi
 
     if ! kubectl get namespace "$NS" >/dev/null 2>&1; then
@@ -147,6 +157,7 @@ get_org_image_ver() {
         rockylinux)     echo "rockylinux9" ;;
         centos)         echo "centos7" ;;
         centos8-stream) echo "centos8-stream" ;;
+        centos9-stream) echo "" ;;
         opensuse)       echo "opensuse-leap-15" ;;
         *)              echo "" ;;
     esac
@@ -302,75 +313,46 @@ create_cloudinit_secret() {
     _step "创建 cloud-init 配置..."
 
     local SECRET_NAME="${VM_NAME}-cloudinit"
-
-    # 删除已存在的 secret
     kubectl delete secret "$SECRET_NAME" -n "$NS" 2>/dev/null || true
 
-    # 为不同系统生成适合的 cloud-init 配置
-    local cloud_init_content
-    cloud_init_content=$(cat <<CLOUDINIT
-#cloud-config
-hostname: ${VM_NAME}
-fqdn: ${VM_NAME}.local
+    # Base64 编码密码以避免 YAML 转义问题
+    local pw_b64
+    pw_b64=$(printf '%s' "$PASSWORD" | base64 -w0)
 
-# 创建 root 用户并设置密码
-users:
-  - name: root
-    lock_passwd: false
-    hashed_passwd: $(echo "$PASSWORD" | openssl passwd -6 -stdin 2>/dev/null || python3 -c "import crypt; print(crypt.crypt('${PASSWORD}', crypt.mksalt(crypt.METHOD_SHA512)))" 2>/dev/null || echo "$PASSWORD")
-
-# SSH 配置
-ssh_pwauth: true
-disable_root: false
-
-# 修改 sshd 配置允许 root 登录和密码认证
-runcmd:
-  - sed -i 's/^#\\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
-  - sed -i 's/^#\\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-  - sed -i 's/^#\\?ChallengeResponseAuthentication.*/ChallengeResponseAuthentication yes/' /etc/ssh/sshd_config
-  - echo "PermitRootLogin yes" >> /etc/ssh/sshd_config.d/99-kubevirt.conf || true
-  - echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config.d/99-kubevirt.conf || true
-  - mkdir -p /etc/ssh/sshd_config.d
-  - printf 'PermitRootLogin yes\nPasswordAuthentication yes\n' > /etc/ssh/sshd_config.d/99-kubevirt.conf
-  - systemctl restart sshd || service ssh restart || true
-  - echo "root:${PASSWORD}" | chpasswd
-
-# 设置时区
-timezone: Asia/Shanghai
-
-# 安装基础工具
-packages:
-  - curl
-  - wget
-  - vim
-  - net-tools
-  - iputils-ping
-package_update: false
-package_upgrade: false
-CLOUDINIT
+    # 创建初始化脚本，安全地设置密码和 SSH
+    local init_script
+    init_script=$(cat <<INITSCRIPT
+#!/bin/sh
+pw=\$(printf '%s' '${pw_b64}' | base64 -d)
+echo "root:\${pw}" | chpasswd
+mkdir -p /etc/ssh/sshd_config.d
+printf 'PermitRootLogin yes\\nPasswordAuthentication yes\\n' > /etc/ssh/sshd_config.d/99-kubevirt.conf
+sed -i 's/^#\\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+sed -i 's/^#\\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+rm -f /tmp/.kubevirt-init.sh
+INITSCRIPT
 )
 
-    # 注意：openssl passwd 对特殊字符可能有问题，直接使用明文密码通过 chpasswd
-    # 使用更可靠的密码设置方法
-    local user_data
-    user_data=$(cat <<CLOUDINIT
-#cloud-config
+    local init_b64
+    init_b64=$(printf '%s' "$init_script" | base64 -w0)
+
+    local user_data="#cloud-config
 hostname: ${VM_NAME}
 users:
   - name: root
     lock_passwd: false
 ssh_pwauth: true
 disable_root: false
+write_files:
+  - path: /tmp/.kubevirt-init.sh
+    permissions: '0700'
+    encoding: b64
+    content: ${init_b64}
 runcmd:
-  - echo "root:${PASSWORD}" | chpasswd
-  - mkdir -p /etc/ssh/sshd_config.d
-  - printf 'PermitRootLogin yes\nPasswordAuthentication yes\n' > /etc/ssh/sshd_config.d/99-kubevirt.conf
-  - systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || service sshd restart 2>/dev/null || service ssh restart 2>/dev/null || true
-timezone: Asia/Shanghai
-CLOUDINIT
-)
+  - /tmp/.kubevirt-init.sh
+timezone: Asia/Shanghai"
 
-    # 创建 Secret
     kubectl create secret generic "$SECRET_NAME" \
         -n "$NS" \
         --from-literal=userdata="$user_data"
@@ -440,7 +422,7 @@ metadata:
     kubevirt.io/end-port: "${END_PORT}"
     kubevirt.io/password: "${PASSWORD}"
 spec:
-  running: false
+  running: true
   template:
     metadata:
       labels:
@@ -456,8 +438,8 @@ spec:
           guest: ${MEMORY}
         resources:
           requests:
-            memory: ${MEMORY}
-            cpu: "${CPU_CORES}"
+            memory: 128Mi
+            cpu: 100m
           limits:
             memory: ${MEMORY}
         devices:
@@ -623,7 +605,7 @@ get_vm_ip() {
     return 1
 }
 
-# ===== 配置 iptables 端口转发 =====
+# ===== 配置端口转发 =====
 setup_port_forward() {
     _step "配置端口转发..."
 
@@ -632,104 +614,15 @@ setup_port_forward() {
         return 1
     fi
 
-    # 确保规则文件目录存在
-    mkdir -p /etc/kubevirt
-    touch "$RULES_FILE"
-
-    local HOST_IP
-    HOST_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' || hostname -I | awk '{print $1}')
-
-    # 清理该 VM 的旧规则
-    cleanup_vm_iptables "$VM_NAME"
-
-    _info "SSH 端口转发：宿主机:${SSH_PORT} → VM:22"
-    # SSH 端口 DNAT（TCP）
-    iptables -t nat -A PREROUTING \
-        -m comment --comment "KUBEVIRT-VM-${VM_NAME}-ssh" \
-        -p tcp --dport "$SSH_PORT" \
-        -j DNAT --to-destination "${VM_IP}:22"
-
-    # 本机访问支持（OUTPUT 链）
-    iptables -t nat -A OUTPUT \
-        -m comment --comment "KUBEVIRT-VM-${VM_NAME}-ssh-local" \
-        -p tcp --dport "$SSH_PORT" \
-        -j DNAT --to-destination "${VM_IP}:22"
-
-    # MASQUERADE（允许 VM 回包）
-    iptables -t nat -A POSTROUTING \
-        -m comment --comment "KUBEVIRT-VM-${VM_NAME}-masq" \
-        -s "${VM_IP}" \
-        -j MASQUERADE
-
-    # 保存 SSH 规则
-    cat >> "$RULES_FILE" <<EOF
-# VM: ${VM_NAME} SSH
--t nat -A PREROUTING -m comment --comment "KUBEVIRT-VM-${VM_NAME}-ssh" -p tcp --dport ${SSH_PORT} -j DNAT --to-destination ${VM_IP}:22
--t nat -A OUTPUT -m comment --comment "KUBEVIRT-VM-${VM_NAME}-ssh-local" -p tcp --dport ${SSH_PORT} -j DNAT --to-destination ${VM_IP}:22
--t nat -A POSTROUTING -m comment --comment "KUBEVIRT-VM-${VM_NAME}-masq" -s ${VM_IP} -j MASQUERADE
-EOF
-
-    # 额外端口范围转发
-    if [ "$START_PORT" != "0" ] && [ "$END_PORT" != "0" ] && [ "$START_PORT" -le "$END_PORT" ]; then
+    detect_fw_backend || return 1
+    _info "SSH 端口转发：宿主机:${SSH_PORT} → VM:22（后端：${FW_BACKEND}）"
+    if [ "$START_PORT" != "0" ] && [ "$END_PORT" != "0" ]; then
         _info "端口范围转发：宿主机:${START_PORT}-${END_PORT} → VM:${START_PORT}-${END_PORT}"
-
-        # TCP DNAT
-        iptables -t nat -A PREROUTING \
-            -m comment --comment "KUBEVIRT-VM-${VM_NAME}-ports-tcp" \
-            -p tcp --dport "${START_PORT}:${END_PORT}" \
-            -j DNAT --to-destination "${VM_IP}"
-
-        # UDP DNAT
-        iptables -t nat -A PREROUTING \
-            -m comment --comment "KUBEVIRT-VM-${VM_NAME}-ports-udp" \
-            -p udp --dport "${START_PORT}:${END_PORT}" \
-            -j DNAT --to-destination "${VM_IP}"
-
-        # 本机 TCP
-        iptables -t nat -A OUTPUT \
-            -m comment --comment "KUBEVIRT-VM-${VM_NAME}-ports-tcp-local" \
-            -p tcp --dport "${START_PORT}:${END_PORT}" \
-            -j DNAT --to-destination "${VM_IP}"
-
-        # 保存端口范围规则
-        cat >> "$RULES_FILE" <<EOF
-# VM: ${VM_NAME} Ports ${START_PORT}-${END_PORT}
--t nat -A PREROUTING -m comment --comment "KUBEVIRT-VM-${VM_NAME}-ports-tcp" -p tcp --dport ${START_PORT}:${END_PORT} -j DNAT --to-destination ${VM_IP}
--t nat -A PREROUTING -m comment --comment "KUBEVIRT-VM-${VM_NAME}-ports-udp" -p udp --dport ${START_PORT}:${END_PORT} -j DNAT --to-destination ${VM_IP}
--t nat -A OUTPUT -m comment --comment "KUBEVIRT-VM-${VM_NAME}-ports-tcp-local" -p tcp --dport ${START_PORT}:${END_PORT} -j DNAT --to-destination ${VM_IP}
-EOF
     fi
 
-    # 启用 FORWARD
-    iptables -P FORWARD ACCEPT 2>/dev/null || true
+    fw_add_vm "$VM_NAME" "$VM_IP" "$SSH_PORT" "$START_PORT" "$END_PORT"
 
     _info "端口转发规则已配置并持久化"
-}
-
-# ===== 清理指定 VM 的 iptables 规则 =====
-cleanup_vm_iptables() {
-    local vm="$1"
-
-    # 从当前 iptables 规则中删除该 VM 的规则
-    for table in nat; do
-        for chain in PREROUTING OUTPUT POSTROUTING; do
-            while true; do
-                local rule_num
-                rule_num=$(iptables -t "$table" -L "$chain" --line-numbers -n 2>/dev/null | \
-                    grep "KUBEVIRT-VM-${vm}" | head -1 | awk '{print $1}' || true)
-                if [ -z "$rule_num" ]; then
-                    break
-                fi
-                iptables -t "$table" -D "$chain" "$rule_num" 2>/dev/null || break
-            done
-        done
-    done
-
-    # 从规则文件中删除该 VM 的规则
-    if [ -f "$RULES_FILE" ]; then
-        sed -i "/KUBEVIRT-VM-${vm}/d" "$RULES_FILE" 2>/dev/null || true
-        sed -i "/# VM: ${vm} /d" "$RULES_FILE" 2>/dev/null || true
-    fi
 }
 
 # ===== 保存连接信息到日志 =====
@@ -824,7 +717,6 @@ main() {
     create_datavolume
     create_virtualmachine
     wait_for_datavolume
-    start_vm
     wait_for_vmi
     get_vm_ip
     setup_port_forward

@@ -17,6 +17,12 @@ _warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 _error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 _step()  { echo -e "${BLUE}[STEP]${NC} $*"; }
 
+# ===== 加载防火墙库 =====
+FIREWALL_LIB="/usr/local/lib/kubevirt/firewall.sh"
+if [ -f "$FIREWALL_LIB" ]; then
+    source "$FIREWALL_LIB"
+fi
+
 check_root() {
     if [ "$(id -u)" != "0" ]; then
         _error "请以 root 权限运行此脚本"
@@ -25,6 +31,9 @@ check_root() {
 
 # ===== 确认操作 =====
 confirm_uninstall() {
+    if [ "${FORCE_YES}" = "y" ]; then
+        return 0
+    fi
     echo ""
     echo -e "${RED}======================================================"
     echo "  警告：此操作将完整卸载 KubeVirt 环境！"
@@ -34,7 +43,7 @@ confirm_uninstall() {
     echo "  - KubeVirt 和 CDI 所有组件"
     echo "  - K3s Kubernetes 集群"
     echo "  - 所有相关配置文件"
-    echo "  - 所有 iptables 端口转发规则"
+    echo "  - 所有端口转发规则"
     echo -e "======================================================${NC}"
     echo ""
 
@@ -153,30 +162,36 @@ uninstall_cdi() {
     _info "CDI 卸载完成"
 }
 
-# ===== 清理 iptables 规则 =====
-cleanup_iptables() {
-    _step "清理 iptables 端口转发规则..."
+# ===== 清理防火墙规则 =====
+cleanup_firewall() {
+    _step "清理端口转发规则..."
 
-    # 清理 KubeVirt 相关的 DNAT 规则
-    # 读取规则文件并逐条删除
-    local RULES_FILE="/etc/kubevirt/iptables-rules"
-    if [ -f "$RULES_FILE" ]; then
-        _info "从规则文件清理 iptables..."
-        while IFS= read -r line; do
-            [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
-            local delete_line="${line/-A/-D}"
-            eval "iptables $delete_line" 2>/dev/null || true
-        done < "$RULES_FILE"
-        rm -f "$RULES_FILE"
+    if [ -f "$FIREWALL_LIB" ]; then
+        fw_cleanup_all
+    else
+        # 回退：手动清理
+        if command -v nft >/dev/null 2>&1; then
+            nft delete table inet kubevirt 2>/dev/null || true
+        fi
+        if command -v iptables >/dev/null 2>&1; then
+            local chain
+            for chain in PREROUTING OUTPUT POSTROUTING; do
+                local i=0
+                while [ "$i" -lt 500 ]; do
+                    local rule_num
+                    rule_num=$(iptables -t nat -L "$chain" --line-numbers -n 2>/dev/null | \
+                        grep "KUBEVIRT-VM-" | head -1 | awk '{print $1}')
+                    [ -z "$rule_num" ] && break
+                    iptables -t nat -D "$chain" "$rule_num" 2>/dev/null || break
+                    i=$((i + 1))
+                done
+            done
+        fi
     fi
+    rm -f /etc/kubevirt/port-rules.conf
+    rm -f /etc/kubevirt/iptables-rules
 
-    # 额外清理：删除所有包含 KUBEVIRT-VM 注释的规则
-    iptables -t nat -S PREROUTING 2>/dev/null | grep "KUBEVIRT-VM\|kubevirt-vm" | while read -r rule; do
-        local del_rule="${rule/-A/-D}"
-        eval "iptables -t nat $del_rule" 2>/dev/null || true
-    done
-
-    _info "iptables 清理完成"
+    _info "防火墙规则清理完成"
 }
 
 # ===== 停用并删除 systemd 服务 =====
@@ -184,6 +199,7 @@ cleanup_systemd() {
     _step "清理 systemd 服务..."
 
     local services=(
+        "kubevirt-firewall"
         "kubevirt-iptables"
     )
 
@@ -239,6 +255,9 @@ cleanup_files() {
     rm -rf /etc/kubevirt
     rm -f /usr/local/bin/kubevirt-restore-iptables.sh
     rm -f /usr/local/bin/kubevirt-clear-iptables.sh
+    rm -f /usr/local/bin/kubevirt-restore-rules.sh
+    rm -f /usr/local/bin/kubevirt-clear-rules.sh
+    rm -rf /usr/local/lib/kubevirt
 
     # K3s 配置
     rm -f /etc/profile.d/k3s.sh
@@ -274,7 +293,7 @@ print_summary() {
     echo "  ✓ CDI 组件"
     echo "  ✓ K3s Kubernetes 集群"
     echo "  ✓ virtctl 工具"
-    echo "  ✓ iptables 端口转发规则"
+    echo "  ✓ 端口转发规则（nftables/iptables）"
     echo "  ✓ 相关配置文件"
     echo ""
     _warn "vmlog 文件未删除，如需清理请手动运行：rm -f vmlog"
@@ -294,7 +313,7 @@ main() {
     stop_all_vms
     uninstall_kubevirt
     uninstall_cdi
-    cleanup_iptables
+    cleanup_firewall
     cleanup_systemd
     remove_virtctl
     uninstall_k3s

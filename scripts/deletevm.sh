@@ -18,7 +18,12 @@ _step()  { echo -e "${BLUE}[STEP]${NC} $*"; }
 
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 NS="kubevirt-vms"
-RULES_FILE="/etc/kubevirt/iptables-rules"
+
+# ===== 加载防火墙库 =====
+FIREWALL_LIB="/usr/local/lib/kubevirt/firewall.sh"
+if [ -f "$FIREWALL_LIB" ]; then
+    source "$FIREWALL_LIB"
+fi
 
 check_root() {
     if [ "$(id -u)" != "0" ]; then
@@ -120,34 +125,17 @@ delete_k8s_resources() {
     fi
 }
 
-# ===== 清理 iptables 规则 =====
-cleanup_iptables() {
-    _step "清理 iptables 端口转发规则..."
+# ===== 清理防火墙规则 =====
+cleanup_firewall_rules() {
+    _step "清理端口转发规则..."
 
-    # 从当前 iptables 规则中删除该 VM 的规则
-    for table in nat; do
-        for chain in PREROUTING OUTPUT POSTROUTING; do
-            local max_iter=20
-            local iter=0
-            while [ "$iter" -lt "$max_iter" ]; do
-                local rule_num
-                rule_num=$(iptables -t "$table" -L "$chain" --line-numbers -n 2>/dev/null | \
-                    grep "KUBEVIRT-VM-${VM_NAME}" | head -1 | awk '{print $1}' || true)
-                if [ -z "$rule_num" ]; then
-                    break
-                fi
-                iptables -t "$table" -D "$chain" "$rule_num" 2>/dev/null || break
-                iter=$((iter + 1))
-            done
-        done
-    done
-
-    # 从规则持久化文件中删除
-    if [ -f "$RULES_FILE" ]; then
-        sed -i "/KUBEVIRT-VM-${VM_NAME}/d" "$RULES_FILE" 2>/dev/null || true
-        sed -i "/# VM: ${VM_NAME} /d" "$RULES_FILE" 2>/dev/null || true
-        _info "iptables 持久化规则已清理"
+    if [ -f "$FIREWALL_LIB" ]; then
+        fw_remove_vm "$VM_NAME"
+    else
+        _warn "防火墙库未找到，跳过规则清理"
     fi
+
+    _info "端口转发规则已清理"
 }
 
 # ===== 从 vmlog 中删除记录 =====
@@ -181,15 +169,17 @@ main() {
 
     echo ""
     _warn "即将删除虚拟机 '${VM_NAME}' 及其所有数据（磁盘、配置、端口转发规则）"
-    read -rp "确认删除？(y/n): " CONFIRM
-    if [ "$CONFIRM" != "y" ] && [ "$CONFIRM" != "Y" ]; then
-        _info "已取消删除"
-        exit 0
+    if [ "${FORCE_YES}" != "y" ]; then
+        read -rp "确认删除？(y/n): " CONFIRM
+        if [ "$CONFIRM" != "y" ] && [ "$CONFIRM" != "Y" ]; then
+            _info "已取消删除"
+            exit 0
+        fi
     fi
 
     stop_vm
     delete_k8s_resources
-    cleanup_iptables
+    cleanup_firewall_rules
     remove_vmlog_entry
 
     echo ""

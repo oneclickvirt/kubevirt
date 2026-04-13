@@ -5,8 +5,6 @@
 # https://github.com/oneclickvirt/kubevirt
 # =====================================================================
 
-set -e
-
 # ===== 版本配置 =====
 K3S_VERSION="v1.29.3+k3s1"
 KUBEVIRT_VERSION="v1.2.1"
@@ -99,14 +97,14 @@ install_dependencies() {
         apt-get update -y -qq
         apt-get install -y -qq \
             curl wget git jq socat conntrack \
-            iptables ebtables ipset iproute2 \
+            nftables iptables ebtables ipset iproute2 \
             ca-certificates gnupg lsb-release \
             qemu-utils cloud-image-utils \
             apache2-utils 2>/dev/null || true
     elif command -v yum >/dev/null 2>&1; then
         yum install -y -q \
             curl wget git jq socat conntrack-tools \
-            iptables ebtables ipset iproute \
+            nftables iptables ebtables ipset iproute \
             ca-certificates gnupg qemu-img 2>/dev/null || true
     fi
     _info "依赖安装完成"
@@ -179,10 +177,12 @@ install_k3s() {
     _info "等待节点就绪..."
     k3s kubectl wait --for=condition=Ready nodes --all --timeout=120s
 
-    # 配置 kubectl 环境变量
+    # 配置 kubectl 环境变量（幂等）
     export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-    echo 'export KUBECONFIG=/etc/rancher/k3s/k3s.yaml' >> /etc/profile.d/k3s.sh
-    echo 'alias kubectl="k3s kubectl"' >> /etc/profile.d/k3s.sh
+    cat > /etc/profile.d/k3s.sh <<'PROFILE'
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+alias kubectl="k3s kubectl"
+PROFILE
     export PATH=$PATH:/usr/local/bin
 
     _info "K3s 安装完成"
@@ -357,11 +357,47 @@ configure_cdi_proxy() {
     _info "CDI 代理配置完成"
 }
 
-# ===== 配置 iptables 持久化 =====
-setup_iptables_persistence() {
-    _step "配置 iptables 持久化服务..."
+# ===== 配置防火墙持久化服务 =====
+setup_firewall_service() {
+    _step "配置防火墙持久化服务..."
 
-    cat > /etc/systemd/system/kubevirt-iptables.service <<'EOF'
+    # 安装防火墙管理库
+    mkdir -p /usr/local/lib/kubevirt /etc/kubevirt
+    local fw_url="https://raw.githubusercontent.com/oneclickvirt/kubevirt/main/scripts/firewall.sh"
+    if ! curl -fsSL --connect-timeout 15 --max-time 30 "$fw_url" -o /usr/local/lib/kubevirt/firewall.sh 2>/dev/null; then
+        if [ ! -f /usr/local/lib/kubevirt/firewall.sh ]; then
+            _error "下载防火墙库失败，请检查网络"
+        fi
+        _warn "下载防火墙库失败，使用已存在的版本"
+    fi
+    chmod +x /usr/local/lib/kubevirt/firewall.sh
+
+    # 检测防火墙后端
+    source /usr/local/lib/kubevirt/firewall.sh
+    detect_fw_backend
+    _info "防火墙后端：${FW_BACKEND}"
+
+    # 创建恢复脚本
+    cat > /usr/local/bin/kubevirt-restore-rules.sh <<'SCRIPT'
+#!/bin/bash
+source /usr/local/lib/kubevirt/firewall.sh
+detect_fw_backend || exit 1
+fw_rebuild
+SCRIPT
+
+    # 创建清除脚本
+    cat > /usr/local/bin/kubevirt-clear-rules.sh <<'SCRIPT'
+#!/bin/bash
+source /usr/local/lib/kubevirt/firewall.sh
+detect_fw_backend || exit 0
+fw_clear_rules
+SCRIPT
+
+    chmod +x /usr/local/bin/kubevirt-restore-rules.sh
+    chmod +x /usr/local/bin/kubevirt-clear-rules.sh
+
+    # systemd 服务
+    cat > /etc/systemd/system/kubevirt-firewall.service <<'EOF'
 [Unit]
 Description=KubeVirt VM Port Forwarding Rules
 After=network.target k3s.service
@@ -370,8 +406,8 @@ Wants=k3s.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/local/bin/kubevirt-restore-iptables.sh
-ExecStop=/usr/local/bin/kubevirt-clear-iptables.sh
+ExecStart=/usr/local/bin/kubevirt-restore-rules.sh
+ExecStop=/usr/local/bin/kubevirt-clear-rules.sh
 StandardOutput=journal
 StandardError=journal
 
@@ -379,41 +415,10 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-    cat > /usr/local/bin/kubevirt-restore-iptables.sh <<'SCRIPT'
-#!/bin/bash
-# 恢复 KubeVirt VM 端口转发规则
-RULES_FILE="/etc/kubevirt/iptables-rules"
-if [ -f "$RULES_FILE" ]; then
-    while IFS= read -r line; do
-        [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
-        eval "iptables $line" 2>/dev/null || true
-    done < "$RULES_FILE"
-fi
-SCRIPT
-
-    cat > /usr/local/bin/kubevirt-clear-iptables.sh <<'SCRIPT'
-#!/bin/bash
-# 清除 KubeVirt VM 端口转发规则（停止服务时）
-RULES_FILE="/etc/kubevirt/iptables-rules"
-if [ -f "$RULES_FILE" ]; then
-    while IFS= read -r line; do
-        [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
-        # 将 -A 替换为 -D 来删除规则
-        delete_line="${line/-A/-D}"
-        eval "iptables $delete_line" 2>/dev/null || true
-    done < "$RULES_FILE"
-fi
-SCRIPT
-
-    chmod +x /usr/local/bin/kubevirt-restore-iptables.sh
-    chmod +x /usr/local/bin/kubevirt-clear-iptables.sh
-    mkdir -p /etc/kubevirt
-    touch /etc/kubevirt/iptables-rules
-
     systemctl daemon-reload
-    systemctl enable kubevirt-iptables.service 2>/dev/null || true
+    systemctl enable kubevirt-firewall.service 2>/dev/null || true
 
-    _info "iptables 持久化服务配置完成"
+    _info "防火墙持久化服务配置完成（${FW_BACKEND}）"
 }
 
 # ===== 配置 IP 转发 =====
@@ -481,7 +486,7 @@ main() {
     configure_storage
     configure_cdi_proxy
     setup_ip_forward
-    setup_iptables_persistence
+    setup_firewall_service
     print_summary
 }
 
