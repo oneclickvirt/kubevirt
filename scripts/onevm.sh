@@ -112,6 +112,26 @@ check_prerequisites() {
     if ss -tlnp "sport = :${SSH_PORT}" 2>/dev/null | grep -q LISTEN; then
         _warn "端口 $SSH_PORT 在宿主机上已被占用，可能导致冲突"
     fi
+
+    # 检测 KVM / 模拟模式
+    _detect_emulation_mode
+}
+
+# ===== 检测 KVM 硬件虚拟化或 QEMU TCG 模拟 =====
+_detect_emulation_mode() {
+    USE_EMULATION=0
+    local kv_emulation
+    kv_emulation=$(kubectl get kubevirt kubevirt -n kubevirt \
+        -o jsonpath='{.spec.configuration.developerConfiguration.useEmulation}' 2>/dev/null || echo "")
+    if [ "$kv_emulation" = "true" ]; then
+        USE_EMULATION=1
+        _warn "KubeVirt 处于 QEMU TCG 软件模拟模式（无 KVM），性能较低"
+    elif [ ! -e /dev/kvm ]; then
+        USE_EMULATION=1
+        _warn "/dev/kvm 不存在，当前可能使用 QEMU TCG 模拟"
+    else
+        _info "KVM 硬件虚拟化可用"
+    fi
 }
 
 # ===== CDN 列表（参考 oneclickvirt/pve 项目） =====
@@ -436,12 +456,6 @@ spec:
           threads: 1
         memory:
           guest: ${MEMORY}
-        resources:
-          requests:
-            memory: 128Mi
-            cpu: 100m
-          limits:
-            memory: ${MEMORY}
         devices:
           disks:
             - name: datavolumedisk
@@ -563,11 +577,13 @@ wait_for_vmi() {
     echo ""
 }
 
-# ===== 获取虚拟机 IP =====
+# ===== 获取虚拟机 IP（IPv4 + IPv6）=====
 get_vm_ip() {
     _step "获取虚拟机内部 IP..."
     local max_retry=60
     local retry=0
+    VM_IP=""
+    VM_IP6="-"
 
     while [ "$retry" -lt "$max_retry" ]; do
         # 方法1：从 VMI 状态获取
@@ -575,7 +591,18 @@ get_vm_ip() {
             -o jsonpath='{.status.interfaces[0].ipAddress}' 2>/dev/null || echo "")
 
         if [ -n "$VM_IP" ] && [ "$VM_IP" != "null" ]; then
-            _info "虚拟机 IP：$VM_IP"
+            _info "虚拟机 IPv4：$VM_IP"
+            # 尝试获取 IPv6 地址
+            local all_ips
+            all_ips=$(kubectl get vmi "$VM_NAME" -n "$NS" \
+                -o jsonpath='{.status.interfaces[0].ipAddresses[*]}' 2>/dev/null || echo "")
+            for ip in $all_ips; do
+                if echo "$ip" | grep -q ':'; then
+                    VM_IP6="$ip"
+                    _info "虚拟机 IPv6：$VM_IP6"
+                    break
+                fi
+            done
             return 0
         fi
 
@@ -590,6 +617,17 @@ get_vm_ip() {
                 -o jsonpath='{.status.podIP}' 2>/dev/null || echo "")
             if [ -n "$VM_IP" ] && [ "$VM_IP" != "null" ]; then
                 _info "虚拟机 Pod IP：$VM_IP（通过 virt-launcher 获取）"
+                # 尝试获取 Pod IPv6
+                local pod_ips
+                pod_ips=$(kubectl get pod "$pod_name" -n "$NS" \
+                    -o jsonpath='{.status.podIPs[*].ip}' 2>/dev/null || echo "")
+                for ip in $pod_ips; do
+                    if echo "$ip" | grep -q ':'; then
+                        VM_IP6="$ip"
+                        _info "虚拟机 Pod IPv6：$VM_IP6"
+                        break
+                    fi
+                done
                 return 0
             fi
         fi
@@ -620,7 +658,7 @@ setup_port_forward() {
         _info "端口范围转发：宿主机:${START_PORT}-${END_PORT} → VM:${START_PORT}-${END_PORT}"
     fi
 
-    fw_add_vm "$VM_NAME" "$VM_IP" "$SSH_PORT" "$START_PORT" "$END_PORT"
+    fw_add_vm "$VM_NAME" "$VM_IP" "$SSH_PORT" "$START_PORT" "$END_PORT" "$VM_IP6"
 
     _info "端口转发规则已配置并持久化"
 }

@@ -54,6 +54,12 @@ check_os() {
 
 check_kvm() {
     _step "检查 KVM 虚拟化支持..."
+    # 检查 CPU 虚拟化标志
+    local cpu_flags
+    cpu_flags=$(grep -cE '(vmx|svm)' /proc/cpuinfo 2>/dev/null || echo 0)
+    if [ "$cpu_flags" -eq 0 ]; then
+        _warn "CPU 不支持硬件虚拟化（vmx/svm），可能在嵌套虚拟化环境中"
+    fi
     if [ ! -e /dev/kvm ]; then
         _warn "/dev/kvm 不存在，尝试加载 kvm 模块..."
         modprobe kvm 2>/dev/null || true
@@ -62,11 +68,11 @@ check_kvm() {
         sleep 1
     fi
     if [ ! -e /dev/kvm ]; then
-        _warn "/dev/kvm 不存在，KubeVirt 将使用软件模拟（性能较低）"
+        _warn "/dev/kvm 不存在，KubeVirt 将使用 QEMU TCG 软件模拟（性能较低）"
         USE_EMULATION=1
     else
         chmod 666 /dev/kvm 2>/dev/null || true
-        _info "KVM 硬件虚拟化可用"
+        _info "KVM 硬件虚拟化可用（嵌套虚拟化或物理机）"
         USE_EMULATION=0
     fi
 }
@@ -377,6 +383,14 @@ setup_firewall_service() {
     detect_fw_backend
     _info "防火墙后端：${FW_BACKEND}"
 
+    # iptables 后端：安装 iptables-persistent 作为额外持久化
+    if [ "$FW_BACKEND" = "iptables" ]; then
+        if command -v apt-get >/dev/null 2>&1; then
+            _info "安装 iptables-persistent 用于规则持久化..."
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables-persistent 2>/dev/null || true
+        fi
+    fi
+
     # 创建恢复脚本
     cat > /usr/local/bin/kubevirt-restore-rules.sh <<'SCRIPT'
 #!/bin/bash
@@ -423,14 +437,20 @@ EOF
 
 # ===== 配置 IP 转发 =====
 setup_ip_forward() {
-    _step "配置 IP 转发..."
+    _step "配置 IP 转发（IPv4 + IPv6）..."
 
-    # 启用 IP 转发
+    # 启用 IPv4 转发
     echo 1 > /proc/sys/net/ipv4/ip_forward
-    echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-kubevirt-ipforward.conf
+    # 启用 IPv6 转发
+    echo 1 > /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || true
+
+    cat > /etc/sysctl.d/99-kubevirt-ipforward.conf <<'SYSCTL'
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+SYSCTL
     sysctl -p /etc/sysctl.d/99-kubevirt-ipforward.conf >/dev/null 2>&1 || true
 
-    _info "IP 转发已启用"
+    _info "IP 转发已启用（IPv4 + IPv6）"
 }
 
 # ===== 输出安装摘要 =====

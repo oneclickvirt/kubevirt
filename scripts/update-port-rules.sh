@@ -48,6 +48,18 @@ update_vm_rules() {
         return 1
     fi
 
+    # 获取 IPv6 地址（如果有）
+    local new_ip6="-"
+    local all_ips
+    all_ips=$(kubectl get vmi "$vm_name" -n "$NS" \
+        -o jsonpath='{.status.interfaces[0].ipAddresses[*]}' 2>/dev/null || echo "")
+    for ip in $all_ips; do
+        if echo "$ip" | grep -q ':'; then
+            new_ip6="$ip"
+            break
+        fi
+    done
+
     # 获取端口信息（从注解）
     local ssh_port
     ssh_port=$(kubectl get vm "$vm_name" -n "$NS" \
@@ -66,7 +78,7 @@ update_vm_rules() {
 
     _info "更新 $vm_name 的端口转发规则（新IP: $new_ip，后端：$(fw_backend_name)）..."
 
-    fw_add_vm "$vm_name" "$new_ip" "$ssh_port" "$start_port" "$end_port"
+    fw_add_vm "$vm_name" "$new_ip" "$ssh_port" "$start_port" "$end_port" "$new_ip6"
 
     _info "规则更新成功：$vm_name → $new_ip（SSH: $ssh_port, 端口: ${start_port}-${end_port}）"
 }
