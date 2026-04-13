@@ -56,7 +56,8 @@ check_kvm() {
     _step "检查 KVM 虚拟化支持..."
     # 检查 CPU 虚拟化标志
     local cpu_flags
-    cpu_flags=$(grep -cE '(vmx|svm)' /proc/cpuinfo 2>/dev/null || echo 0)
+    cpu_flags=$(grep -cE '(vmx|svm)' /proc/cpuinfo 2>/dev/null) || true
+    cpu_flags="${cpu_flags:-0}"
     if [ "$cpu_flags" -eq 0 ]; then
         _warn "CPU 不支持硬件虚拟化（vmx/svm），可能在嵌套虚拟化环境中"
     fi
