@@ -146,10 +146,21 @@ _ipt_rebuild() {
 
 # ===== iptables: 通过 netfilter-persistent 保存规则 =====
 _ipt_save_persistent() {
+    # 方法1: netfilter-persistent (Debian/Ubuntu 推荐)
     if command -v netfilter-persistent >/dev/null 2>&1; then
         netfilter-persistent save 2>/dev/null || true
+    # 方法2: iptables-persistent 传统方式
     elif [ -x /etc/init.d/iptables-persistent ]; then
         /etc/init.d/iptables-persistent save 2>/dev/null || true
+    # 方法3: Red Hat/CentOS 方式
+    elif command -v iptables-save >/dev/null 2>&1; then
+        # 保存 IPv4 规则
+        mkdir -p /etc/sysconfig
+        iptables-save > /etc/sysconfig/iptables 2>/dev/null || true
+        # 保存 IPv6 规则（如果 ip6tables 可用）
+        if command -v ip6tables-save >/dev/null 2>&1; then
+            ip6tables-save > /etc/sysconfig/ip6tables 2>/dev/null || true
+        fi
     fi
 }
 
@@ -217,14 +228,39 @@ fw_clear_rules() {
 }
 
 # ===== 清除所有 KubeVirt 规则并清空状态文件 =====
+# 用于完全卸载时，删除所有KUBEVIRT相关的防火墙规则
+# 并持久化清理结果，确保重启后规则不会恢复
 fw_cleanup_all() {
     detect_fw_backend || return 0
 
     case "$FW_BACKEND" in
-        nftables) nft delete table inet kubevirt 2>/dev/null || true ;;
-        iptables) _ipt_flush ; _ipt_save_persistent ;;
+        nftables) 
+            nft delete table inet kubevirt 2>/dev/null || true 
+            ;;
+        iptables) 
+            # 清除IPv4规则
+            _ipt_flush
+            # 同时清除IPv6规则（如果存在）
+            if command -v ip6tables >/dev/null 2>&1; then
+                local chain
+                for chain in PREROUTING OUTPUT POSTROUTING; do
+                    local i=0
+                    while [ "$i" -lt 500 ]; do
+                        local rule_num
+                        rule_num=$(ip6tables -t nat -L "$chain" --line-numbers -n 2>/dev/null | \
+                            grep "KUBEVIRT-VM-" | head -1 | awk '{print $1}')
+                        [ -z "$rule_num" ] && break
+                        ip6tables -t nat -D "$chain" "$rule_num" 2>/dev/null || break
+                        i=$((i + 1))
+                    done
+                done
+            fi
+            # 持久化清理后的规则（IPv4 + IPv6）
+            _ipt_save_persistent
+            ;;
     esac
 
+    # 清空状态文件
     [ -f "$KUBEVIRT_PORT_RULES" ] && : > "$KUBEVIRT_PORT_RULES"
 }
 

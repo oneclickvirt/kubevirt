@@ -387,8 +387,26 @@ setup_firewall_service() {
     # iptables 后端：安装 iptables-persistent 作为额外持久化
     if [ "$FW_BACKEND" = "iptables" ]; then
         if command -v apt-get >/dev/null 2>&1; then
-            _info "安装 iptables-persistent 用于规则持久化..."
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables-persistent 2>/dev/null || true
+            _info "安装 iptables-persistent 用于规则持久化（IPv4 + IPv6）..."
+            # 预配置避免安装时的交互提示
+            echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections
+            echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables-persistent netfilter-persistent 2>/dev/null || true
+            # 启用并启动服务
+            systemctl enable netfilter-persistent 2>/dev/null || true
+            systemctl start netfilter-persistent 2>/dev/null || true
+            # 立即保存当前规则（IPv4 + IPv6）
+            netfilter-persistent save 2>/dev/null || true
+        elif command -v yum >/dev/null 2>&1; then
+            _info "安装 iptables-services 用于规则持久化（IPv4 + IPv6）..."
+            yum install -y -q iptables-services 2>/dev/null || true
+            # 立即保存当前规则
+            mkdir -p /etc/sysconfig
+            iptables-save > /etc/sysconfig/iptables 2>/dev/null || true
+            ip6tables-save > /etc/sysconfig/ip6tables 2>/dev/null || true
+            # 启用并启动服务
+            systemctl enable iptables ip6tables 2>/dev/null || true
+            systemctl start iptables ip6tables 2>/dev/null || true
         fi
     fi
 

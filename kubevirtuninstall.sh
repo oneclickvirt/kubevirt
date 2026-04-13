@@ -167,6 +167,7 @@ cleanup_firewall() {
     _step "清理端口转发规则..."
 
     if [ -f "$FIREWALL_LIB" ]; then
+        # 使用防火墙库清理（推荐，会自动持久化）
         fw_cleanup_all
     else
         # 回退：手动清理
@@ -174,6 +175,7 @@ cleanup_firewall() {
             nft delete table inet kubevirt 2>/dev/null || true
         fi
         if command -v iptables >/dev/null 2>&1; then
+            # 清理IPv4规则
             local chain
             for chain in PREROUTING OUTPUT POSTROUTING; do
                 local i=0
@@ -186,12 +188,36 @@ cleanup_firewall() {
                     i=$((i + 1))
                 done
             done
+            # 清理IPv6规则
+            if command -v ip6tables >/dev/null 2>&1; then
+                for chain in PREROUTING OUTPUT POSTROUTING; do
+                    local i=0
+                    while [ "$i" -lt 500 ]; do
+                        local rule_num
+                        rule_num=$(ip6tables -t nat -L "$chain" --line-numbers -n 2>/dev/null | \
+                            grep "KUBEVIRT-VM-" | head -1 | awk '{print $1}')
+                        [ -z "$rule_num" ] && break
+                        ip6tables -t nat -D "$chain" "$rule_num" 2>/dev/null || break
+                        i=$((i + 1))
+                    done
+                done
+            fi
+            # 持久化清理后的规则
+            if command -v netfilter-persistent >/dev/null 2>&1; then
+                netfilter-persistent save 2>/dev/null || true
+            elif [ -x /etc/init.d/iptables-persistent ]; then
+                /etc/init.d/iptables-persistent save 2>/dev/null || true
+            elif command -v iptables-save >/dev/null 2>&1; then
+                mkdir -p /etc/sysconfig
+                iptables-save > /etc/sysconfig/iptables 2>/dev/null || true
+                ip6tables-save > /etc/sysconfig/ip6tables 2>/dev/null || true
+            fi
         fi
     fi
     rm -f /etc/kubevirt/port-rules.conf
     rm -f /etc/kubevirt/iptables-rules
 
-    _info "防火墙规则清理完成"
+    _info "防火墙规则清理完成（已持久化）"
 }
 
 # ===== 停用并删除 systemd 服务 =====
@@ -293,10 +319,11 @@ print_summary() {
     echo "  ✓ CDI 组件"
     echo "  ✓ K3s Kubernetes 集群"
     echo "  ✓ virtctl 工具"
-    echo "  ✓ 端口转发规则（nftables/iptables）"
+    echo "  ✓ 端口转发规则（nftables/iptables，含持久化规则）"
     echo "  ✓ 相关配置文件"
     echo ""
     _warn "vmlog 文件未删除，如需清理请手动运行：rm -f vmlog"
+    _warn "iptables-persistent/netfilter-persistent 服务未卸载（可能有其他用途）"
     echo "======================================================"
 }
 

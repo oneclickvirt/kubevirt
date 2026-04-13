@@ -152,5 +152,9 @@ virtctl restart <vmname> -n kubevirt-vms
 
 1. 虚拟机首次启动需要等待镜像下载导入（根据网速可能需要 5-20 分钟）
 2. 宿主机需要开启 KVM 嵌套虚拟化或直接使用裸金属服务器
-3. 端口转发通过 iptables 实现，重启后自动通过 systemd 服务恢复
+3. 端口转发通过 iptables/nftables 实现（支持IPv4 + IPv6双栈）：
+   - 使用 systemd 服务在重启后自动恢复规则
+   - Debian/Ubuntu 系统自动安装 `iptables-persistent` 和 `netfilter-persistent`
+   - Red Hat/CentOS 系统自动安装 `iptables-services`
+   - 规则变更后自动持久化，确保重启后不失效
 4. 如需重置密码，通过 `virtctl console` 进入控制台手动修改
