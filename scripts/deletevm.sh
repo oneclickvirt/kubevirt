@@ -4,6 +4,17 @@
 # 用法: ./deletevm.sh <vmname> [rmlog:y/n]
 # https://github.com/oneclickvirt/kubevirt
 # =====================================================================
+#
+# 支持通过环境变量实现无交互删除：
+#
+#   AUTO_YES=y   跳过删除确认提示（FORCE_YES=y 同效）
+#   RMLOG=n      保留 vmlog 中该 VM 的记录（默认删除）
+#
+# 示例：
+#   AUTO_YES=y ./deletevm.sh vm1
+#   AUTO_YES=y RMLOG=n ./deletevm.sh vm1
+#
+# =====================================================================
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -157,7 +168,8 @@ main() {
     fi
 
     VM_NAME="$1"
-    REMOVE_LOG="${2:-y}"
+    # 命令行第2参数优先，否则读环境变量 RMLOG，最终默认 y
+    REMOVE_LOG="${2:-${RMLOG:-y}}"
 
     echo "======================================================"
     echo -e "${RED}  KubeVirt 虚拟机删除脚本${NC}"
@@ -169,7 +181,7 @@ main() {
 
     echo ""
     _warn "即将删除虚拟机 '${VM_NAME}' 及其所有数据（磁盘、配置、端口转发规则）"
-    if [ "${FORCE_YES}" != "y" ]; then
+    if [ "${FORCE_YES}" != "y" ] && [ "${AUTO_YES}" != "y" ]; then
         read -rp "确认删除？(y/n): " CONFIRM
         if [ "$CONFIRM" != "y" ] && [ "$CONFIRM" != "Y" ]; then
             _info "已取消删除"

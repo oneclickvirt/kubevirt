@@ -4,12 +4,28 @@
 # 基于 K3s + KubeVirt + CDI 的虚拟机环境
 # https://github.com/oneclickvirt/kubevirt
 # =====================================================================
+#
+# 支持通过环境变量实现完全无交互安装：
+#
+#   K3S_VERSION       K3s 版本          默认: v1.29.3+k3s1
+#   KUBEVIRT_VERSION  KubeVirt 版本     默认: v1.2.1
+#   CDI_VERSION       CDI 版本          默认: v1.59.0
+#   VIRTCTL_VERSION   virtctl 版本      默认: v1.2.1
+#
+# 示例（一键无交互安装）：
+#   bash kubevirtinstall.sh
+#   KUBEVIRT_VERSION=v1.3.0 CDI_VERSION=v1.60.0 bash kubevirtinstall.sh
+#
+# =====================================================================
 
-# ===== 版本配置 =====
-K3S_VERSION="v1.29.3+k3s1"
-KUBEVIRT_VERSION="v1.2.1"
-CDI_VERSION="v1.59.0"
-VIRTCTL_VERSION="v1.2.1"
+# ===== 全局非交互模式 =====
+export DEBIAN_FRONTEND=noninteractive
+
+# ===== 版本配置（支持环境变量覆盖）=====
+K3S_VERSION="${K3S_VERSION:-v1.29.3+k3s1}"
+KUBEVIRT_VERSION="${KUBEVIRT_VERSION:-v1.2.1}"
+CDI_VERSION="${CDI_VERSION:-v1.59.0}"
+VIRTCTL_VERSION="${VIRTCTL_VERSION:-v1.2.1}"
 
 # ===== 颜色输出 =====
 RED='\033[0;31m'
@@ -99,7 +115,6 @@ check_resources() {
 # ===== 依赖安装 =====
 install_dependencies() {
     _step "安装基础依赖..."
-    export DEBIAN_FRONTEND=noninteractive
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update -y -qq
         apt-get install -y -qq \

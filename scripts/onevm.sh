@@ -4,6 +4,26 @@
 # 用法: ./onevm.sh <name> <cpu> <memory_gb> <disk_gb> <password> <sshport> <startport> <endport> [system]
 # https://github.com/oneclickvirt/kubevirt
 # =====================================================================
+#
+# 也可通过环境变量提供参数（命令行参数优先）：
+#
+#   VM_NAME      虚拟机名称      （必须或位置参数1）
+#   CPU          CPU 核数        默认: 1
+#   MEMORY_GB    内存（GB）       默认: 1
+#   DISK_GB      磁盘（GB）       默认: 10
+#   PASSWORD     root 密码       默认: 123456
+#   SSH_PORT     SSH 宿主机端口   默认: 25000
+#   START_PORT   额外端口起始     默认: 34975
+#   END_PORT     额外端口结束     默认: 35000
+#   SYSTEM       操作系统        默认: ubuntu
+#
+# 示例：
+#   ./onevm.sh vm1 2 2 20 MyPass 25000 34975 35000 debian
+#   VM_NAME=vm1 CPU=2 MEMORY_GB=2 DISK_GB=20 PASSWORD=MyPass \
+#   SSH_PORT=25000 START_PORT=34975 END_PORT=35000 SYSTEM=debian \
+#   bash onevm.sh
+#
+# =====================================================================
 
 # ===== 颜色输出 =====
 RED='\033[0;31m'
@@ -28,17 +48,17 @@ if [ ! -f "$FIREWALL_LIB" ]; then
 fi
 source "$FIREWALL_LIB"
 
-# ===== 参数解析 =====
+# ===== 参数解析（命令行参数优先，否则回退到同名环境变量）=====
 parse_args() {
-    VM_NAME="${1:-test}"
-    CPU="${2:-1}"
-    MEMORY_GB="${3:-1}"
-    DISK_GB="${4:-10}"
-    PASSWORD="${5:-123456}"
-    SSH_PORT="${6:-25000}"
-    START_PORT="${7:-34975}"
-    END_PORT="${8:-35000}"
-    SYSTEM="${9:-ubuntu}"
+    VM_NAME="${1:-${VM_NAME:-test}}"
+    CPU="${2:-${CPU:-1}}"
+    MEMORY_GB="${3:-${MEMORY_GB:-1}}"
+    DISK_GB="${4:-${DISK_GB:-10}}"
+    PASSWORD="${5:-${PASSWORD:-123456}}"
+    SSH_PORT="${6:-${SSH_PORT:-25000}}"
+    START_PORT="${7:-${START_PORT:-34975}}"
+    END_PORT="${8:-${END_PORT:-35000}}"
+    SYSTEM="${9:-${SYSTEM:-ubuntu}}"
 
     # 转换为小写
     SYSTEM=$(echo "$SYSTEM" | tr '[:upper:]' '[:lower:]')

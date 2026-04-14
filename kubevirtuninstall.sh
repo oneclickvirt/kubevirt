@@ -4,6 +4,16 @@
 # 完整清理 K3s + KubeVirt + CDI 及所有虚拟机
 # https://github.com/oneclickvirt/kubevirt
 # =====================================================================
+#
+# 支持通过环境变量实现完全无交互卸载：
+#
+#   AUTO_YES=y   跳过所有确认提示，直接执行卸载
+#   FORCE_YES=y  同 AUTO_YES=y（兼容旧版写法）
+#
+# 示例（一键静默卸载）：
+#   AUTO_YES=y bash kubevirtuninstall.sh
+#
+# =====================================================================
 
 # ===== 颜色输出 =====
 RED='\033[0;31m'
@@ -31,7 +41,7 @@ check_root() {
 
 # ===== 确认操作 =====
 confirm_uninstall() {
-    if [ "${FORCE_YES}" = "y" ]; then
+    if [ "${FORCE_YES}" = "y" ] || [ "${AUTO_YES}" = "y" ]; then
         return 0
     fi
     echo ""

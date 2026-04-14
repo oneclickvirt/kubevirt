@@ -1,7 +1,29 @@
 #!/bin/bash
 # =====================================================================
-# KubeVirt 批量虚拟机开设脚本（交互式）
+# KubeVirt 批量虚拟机开设脚本（支持交互式与环境变量驱动）
 # https://github.com/oneclickvirt/kubevirt
+# =====================================================================
+#
+# 支持通过环境变量实现完全无交互批量创建：
+#
+#   VM_COUNT          虚拟机数量              默认: 1
+#   VM_PREFIX         虚拟机名称前缀          默认: vm
+#   START_NUM         起始编号               默认: 1
+#   CPU               每台 CPU 核数           默认: 1
+#   MEMORY_GB         每台内存（GB）           默认: 1
+#   DISK_GB           每台磁盘（GB）           默认: 10
+#   PASSWORD          root 密码              默认: 随机生成
+#   SSH_START_PORT    SSH 起始端口            默认: 25000
+#   PORT_RANGE_SIZE   每台额外端口数量         默认: 26
+#   EXTRA_PORT_START  额外端口起始值           默认: 35000
+#   SYSTEM            操作系统               默认: ubuntu
+#   AUTO_YES=y        跳过所有确认提示
+#
+# 示例：
+#   VM_COUNT=3 CPU=2 MEMORY_GB=2 DISK_GB=20 PASSWORD=MyPass123 \
+#   SSH_START_PORT=25000 PORT_RANGE_SIZE=26 EXTRA_PORT_START=35000 \
+#   SYSTEM=debian AUTO_YES=y bash create_vm.sh
+#
 # =====================================================================
 
 RED='\033[0;31m'
@@ -38,81 +60,118 @@ check_onevm_script() {
     _info "使用脚本：$ONEVM_SCRIPT"
 }
 
-# ===== 交互式参数收集 =====
-collect_params() {
-    echo ""
-    echo "======================================================"
-    echo -e "${GREEN}  KubeVirt 批量虚拟机开设${NC}"
-    echo "======================================================"
-    echo ""
+# ===== 是否处于无交互模式（所有参数均由环境变量提供）=====
+_is_noninteractive() {
+    [ "${AUTO_YES}" = "y" ] || \
+    ( [ -n "${VM_COUNT+x}" ] && [ -n "${VM_PREFIX+x}" ] && \
+      [ -n "${CPU+x}" ] && [ -n "${MEMORY_GB+x}" ] && \
+      [ -n "${DISK_GB+x}" ] && [ -n "${PASSWORD+x}" ] && \
+      [ -n "${SSH_START_PORT+x}" ] && [ -n "${SYSTEM+x}" ] )
+}
 
-    # 数量
-    read -rp "请输入虚拟机数量 [默认: 1]: " VM_COUNT
+# ===== 交互式参数收集（若环境变量已设置则使用环境变量，跳过 read）=====
+collect_params() {
+    # 若 AUTO_YES=y 且所有必要变量已设置，无需打印菜单
+    if ! _is_noninteractive; then
+        echo ""
+        echo "======================================================"
+        echo -e "${GREEN}  KubeVirt 批量虚拟机开设${NC}"
+        echo "======================================================"
+        echo ""
+    fi
+
+    # ----- 数量 -----
+    if [ -z "${VM_COUNT+x}" ]; then
+        read -rp "请输入虚拟机数量 [默认: 1]: " VM_COUNT
+    fi
     VM_COUNT="${VM_COUNT:-1}"
     if ! [[ "$VM_COUNT" =~ ^[0-9]+$ ]] || [ "$VM_COUNT" -lt 1 ]; then
         _error "数量无效：$VM_COUNT"
     fi
 
-    # 名称前缀和起始编号
-    read -rp "请输入虚拟机名称前缀 [默认: vm]: " VM_PREFIX
+    # ----- 名称前缀 -----
+    if [ -z "${VM_PREFIX+x}" ]; then
+        read -rp "请输入虚拟机名称前缀 [默认: vm]: " VM_PREFIX
+    fi
     VM_PREFIX="${VM_PREFIX:-vm}"
     if ! echo "$VM_PREFIX" | grep -qE '^[a-z][a-z0-9-]*$'; then
         _error "名称前缀无效，只允许小写字母、数字和连字符，且必须以字母开头"
     fi
 
-    read -rp "请输入起始编号 [默认: 1]: " START_NUM
+    # ----- 起始编号 -----
+    if [ -z "${START_NUM+x}" ]; then
+        read -rp "请输入起始编号 [默认: 1]: " START_NUM
+    fi
     START_NUM="${START_NUM:-1}"
 
-    # CPU
-    read -rp "请输入每台虚拟机 CPU 核数 [默认: 1]: " CPU
+    # ----- CPU -----
+    if [ -z "${CPU+x}" ]; then
+        read -rp "请输入每台虚拟机 CPU 核数 [默认: 1]: " CPU
+    fi
     CPU="${CPU:-1}"
 
-    # 内存
-    read -rp "请输入每台虚拟机内存（GB）[默认: 1]: " MEMORY_GB
+    # ----- 内存 -----
+    if [ -z "${MEMORY_GB+x}" ]; then
+        read -rp "请输入每台虚拟机内存（GB）[默认: 1]: " MEMORY_GB
+    fi
     MEMORY_GB="${MEMORY_GB:-1}"
 
-    # 磁盘
-    read -rp "请输入每台虚拟机磁盘大小（GB）[默认: 10]: " DISK_GB
+    # ----- 磁盘 -----
+    if [ -z "${DISK_GB+x}" ]; then
+        read -rp "请输入每台虚拟机磁盘大小（GB）[默认: 10]: " DISK_GB
+    fi
     DISK_GB="${DISK_GB:-10}"
 
-    # 密码
-    read -rp "请输入 root 密码 [默认: 随机生成]: " PASSWORD
+    # ----- 密码 -----
+    if [ -z "${PASSWORD+x}" ]; then
+        read -rp "请输入 root 密码 [默认: 随机生成]: " PASSWORD
+    fi
     if [ -z "$PASSWORD" ]; then
         PASSWORD=$(tr -dc 'A-Za-z0-9!@#$' </dev/urandom | head -c 16 2>/dev/null || \
                    cat /dev/urandom | tr -dc 'A-Za-z0-9' | fold -w 12 | head -n 1)
         _info "生成随机密码：${PASSWORD}"
     fi
 
-    # SSH 起始端口
-    read -rp "请输入 SSH 起始端口 [默认: 25000]: " SSH_START_PORT
+    # ----- SSH 起始端口 -----
+    if [ -z "${SSH_START_PORT+x}" ]; then
+        read -rp "请输入 SSH 起始端口 [默认: 25000]: " SSH_START_PORT
+    fi
     SSH_START_PORT="${SSH_START_PORT:-25000}"
 
-    # 额外端口范围（每台 VM 的端口数）
-    read -rp "请输入每台 VM 的额外端口范围大小（0=不分配）[默认: 26]: " PORT_RANGE_SIZE
+    # ----- 额外端口范围大小 -----
+    if [ -z "${PORT_RANGE_SIZE+x}" ]; then
+        read -rp "请输入每台 VM 的额外端口范围大小（0=不分配）[默认: 26]: " PORT_RANGE_SIZE
+    fi
     PORT_RANGE_SIZE="${PORT_RANGE_SIZE:-26}"
 
-    # 起始额外端口
+    # ----- 额外端口起始值 -----
     if [ "$PORT_RANGE_SIZE" -gt 0 ]; then
-        read -rp "请输入额外端口起始值 [默认: 35000]: " EXTRA_PORT_START
+        if [ -z "${EXTRA_PORT_START+x}" ]; then
+            read -rp "请输入额外端口起始值 [默认: 35000]: " EXTRA_PORT_START
+        fi
         EXTRA_PORT_START="${EXTRA_PORT_START:-35000}"
     fi
 
-    # 操作系统
-    echo ""
-    echo "可选操作系统："
-    echo "  1) ubuntu       - Ubuntu 22.04 LTS"
-    echo "  2) debian       - Debian 12"
-    echo "  3) debian11     - Debian 11"
-    echo "  4) almalinux    - AlmaLinux 9"
-    echo "  5) rockylinux   - RockyLinux 9"
-    echo "  6) centos       - CentOS 7"
-    echo "  7) centos8-stream - CentOS Stream 8"
-    echo "  8) centos-stream  - CentOS Stream 9"
-    echo "  9) opensuse     - openSUSE Leap 15.5"
-    echo ""
-    echo "  镜像优先从 oneclickvirt/pve_kvm_images 和 oneclickvirt/kvm_images 获取"
-    read -rp "请选择系统编号或输入系统名称 [默认: 1/ubuntu]: " SYSTEM_INPUT
-    SYSTEM_INPUT="${SYSTEM_INPUT:-1}"
+    # ----- 操作系统 -----
+    if [ -z "${SYSTEM+x}" ]; then
+        echo ""
+        echo "可选操作系统："
+        echo "  1) ubuntu       - Ubuntu 22.04 LTS"
+        echo "  2) debian       - Debian 12"
+        echo "  3) debian11     - Debian 11"
+        echo "  4) almalinux    - AlmaLinux 9"
+        echo "  5) rockylinux   - RockyLinux 9"
+        echo "  6) centos       - CentOS 7"
+        echo "  7) centos8-stream - CentOS Stream 8"
+        echo "  8) centos-stream  - CentOS Stream 9"
+        echo "  9) opensuse     - openSUSE Leap 15.5"
+        echo ""
+        echo "  镜像优先从 oneclickvirt/pve_kvm_images 和 oneclickvirt/kvm_images 获取"
+        read -rp "请选择系统编号或输入系统名称 [默认: 1/ubuntu]: " SYSTEM_INPUT
+        SYSTEM_INPUT="${SYSTEM_INPUT:-1}"
+    else
+        SYSTEM_INPUT="${SYSTEM}"
+    fi
 
     case "$SYSTEM_INPUT" in
         1|ubuntu)        SYSTEM="ubuntu" ;;
@@ -127,7 +186,7 @@ collect_params() {
         *) _error "无效的系统选择：$SYSTEM_INPUT" ;;
     esac
 
-    # 确认
+    # ----- 配置预览 -----
     echo ""
     echo "======================================================"
     echo "  批量创建配置预览："
@@ -139,15 +198,19 @@ collect_params() {
     echo "  系统:         ${SYSTEM}"
     echo "  密码:         ${PASSWORD}"
     echo "  SSH 端口范围: ${SSH_START_PORT} ~ $((SSH_START_PORT + VM_COUNT - 1))"
-    if [ "$PORT_RANGE_SIZE" -gt 0 ]; then
+    if [ "${PORT_RANGE_SIZE:-0}" -gt 0 ]; then
         echo "  额外端口:     ${EXTRA_PORT_START} ~ $((EXTRA_PORT_START + VM_COUNT * PORT_RANGE_SIZE - 1))"
     fi
     echo "======================================================"
     echo ""
-    read -rp "确认创建？(y/n): " CONFIRM
-    if [ "$CONFIRM" != "y" ] && [ "$CONFIRM" != "Y" ]; then
-        _info "已取消"
-        exit 0
+
+    # ----- 最终确认 -----
+    if [ "${AUTO_YES}" != "y" ]; then
+        read -rp "确认创建？(y/n): " CONFIRM
+        if [ "$CONFIRM" != "y" ] && [ "$CONFIRM" != "Y" ]; then
+            _info "已取消"
+            exit 0
+        fi
     fi
 }
 
@@ -159,9 +222,13 @@ check_disk_space() {
 
     if [ "$available_gb" -lt "$required_gb" ]; then
         _warn "可用磁盘空间 ${available_gb}GB 可能不足（需要约 ${required_gb}GB）"
-        read -rp "是否继续？(y/n): " cont
-        if [ "$cont" != "y" ] && [ "$cont" != "Y" ]; then
-            exit 0
+        if [ "${AUTO_YES}" != "y" ]; then
+            read -rp "是否继续？(y/n): " cont
+            if [ "$cont" != "y" ] && [ "$cont" != "Y" ]; then
+                exit 0
+            fi
+        else
+            _warn "AUTO_YES=y，忽略磁盘空间警告，继续执行..."
         fi
     fi
 }
