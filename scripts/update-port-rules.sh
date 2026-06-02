@@ -31,45 +31,30 @@ check_root() {
     fi
 }
 
-update_vm_rules() {
-    local vm_name="$1"
-
-    if ! kubectl get vm "$vm_name" -n "$NS" >/dev/null 2>&1; then
-        _error "虚拟机 $vm_name 不存在"
+ensure_kubectl() {
+    if command -v kubectl >/dev/null 2>&1; then
+        return 0
     fi
+    if command -v k3s >/dev/null 2>&1; then
+        kubectl() { k3s kubectl "$@"; }
+        return 0
+    fi
+    _error "未找到 kubectl/k3s，请先安装 KubeVirt 环境"
+}
 
-    # 获取新 IP
-    local new_ip
-    new_ip=$(kubectl get vmi "$vm_name" -n "$NS" \
-        -o jsonpath='{.status.interfaces[0].ipAddress}' 2>/dev/null || echo "")
+ensure_jq() {
+    if ! command -v jq >/dev/null 2>&1; then
+        _error "未找到 jq，请先安装依赖或重新运行安装脚本"
+    fi
+}
+
+apply_vm_rule_record() {
+    local vm_name="$1" new_ip="$2" new_ip6="${3:--}" ssh_port="$4" start_port="${5:-0}" end_port="${6:-0}"
 
     if [ -z "$new_ip" ] || [ "$new_ip" = "null" ]; then
         _warn "无法获取虚拟机 $vm_name 的 IP，虚拟机可能未运行"
         return 1
     fi
-
-    # 获取 IPv6 地址（如果有）
-    local new_ip6="-"
-    local all_ips
-    all_ips=$(kubectl get vmi "$vm_name" -n "$NS" \
-        -o jsonpath='{.status.interfaces[0].ipAddresses[*]}' 2>/dev/null || echo "")
-    for ip in $all_ips; do
-        if echo "$ip" | grep -q ':'; then
-            new_ip6="$ip"
-            break
-        fi
-    done
-
-    # 获取端口信息（从注解）
-    local ssh_port
-    ssh_port=$(kubectl get vm "$vm_name" -n "$NS" \
-        -o jsonpath='{.metadata.annotations.kubevirt\.io/ssh-port}' 2>/dev/null || echo "")
-    local start_port
-    start_port=$(kubectl get vm "$vm_name" -n "$NS" \
-        -o jsonpath='{.metadata.annotations.kubevirt\.io/start-port}' 2>/dev/null || echo "0")
-    local end_port
-    end_port=$(kubectl get vm "$vm_name" -n "$NS" \
-        -o jsonpath='{.metadata.annotations.kubevirt\.io/end-port}' 2>/dev/null || echo "0")
 
     if [ -z "$ssh_port" ]; then
         _warn "虚拟机 $vm_name 没有 SSH 端口注解，跳过"
@@ -83,26 +68,69 @@ update_vm_rules() {
     _info "规则更新成功：$vm_name → $new_ip（SSH: $ssh_port, 端口: ${start_port}-${end_port}）"
 }
 
+update_vm_rules() {
+    local vm_name="$1"
+    local vm_json vmi_json record
+
+    if ! vm_json=$(kubectl get vm "$vm_name" -n "$NS" -o json 2>/dev/null); then
+        _error "虚拟机 $vm_name 不存在"
+    fi
+    vmi_json=$(kubectl get vmi "$vm_name" -n "$NS" -o json 2>/dev/null || printf '{}\n')
+
+    record=$(jq -n -r --argjson vm "$vm_json" --argjson vmi "$vmi_json" '
+        [
+          ($vm.metadata.name // ""),
+          ($vmi.status.interfaces[0].ipAddress // ""),
+          ([ $vmi.status.interfaces[0].ipAddresses[]? | select(test(":")) ][0] // "-"),
+          ($vm.metadata.annotations["kubevirt.io/ssh-port"] // ""),
+          ($vm.metadata.annotations["kubevirt.io/start-port"] // "0"),
+          ($vm.metadata.annotations["kubevirt.io/end-port"] // "0")
+        ] | @tsv
+    ')
+
+    IFS=$'\t' read -r vm_name new_ip new_ip6 ssh_port start_port end_port <<< "$record"
+    apply_vm_rule_record "$vm_name" "$new_ip" "$new_ip6" "$ssh_port" "$start_port" "$end_port"
+}
+
 # 更新所有 VM 规则
 update_all_vms() {
     _info "更新所有运行中虚拟机的端口转发规则..."
-    local vmi_list
-    vmi_list=$(kubectl get vmi -n "$NS" --no-headers 2>/dev/null | awk '{print $1}' || true)
+    local vm_json vmi_json records vmi_count
+    vm_json=$(kubectl get vm -n "$NS" -o json 2>/dev/null || printf '{"items":[]}\n')
+    vmi_json=$(kubectl get vmi -n "$NS" -o json 2>/dev/null || printf '{"items":[]}\n')
+    vmi_count=$(printf '%s' "$vmi_json" | jq '.items | length')
 
-    if [ -z "$vmi_list" ]; then
+    if [ "$vmi_count" -eq 0 ]; then
         _warn "没有运行中的虚拟机实例"
         return
     fi
 
-    while IFS= read -r vm; do
-        update_vm_rules "$vm" || true
-    done <<< "$vmi_list"
+    records=$(printf '%s' "$vmi_json" | jq -r --argjson vms "$vm_json" '
+        .items[]? as $vmi |
+        ($vmi.metadata.name // "") as $name |
+        ([ $vms.items[]? | select(.metadata.name == $name) ][0] // {}) as $vm |
+        [
+          $name,
+          ($vmi.status.interfaces[0].ipAddress // ""),
+          ([ $vmi.status.interfaces[0].ipAddresses[]? | select(test(":")) ][0] // "-"),
+          ($vm.metadata.annotations["kubevirt.io/ssh-port"] // ""),
+          ($vm.metadata.annotations["kubevirt.io/start-port"] // "0"),
+          ($vm.metadata.annotations["kubevirt.io/end-port"] // "0")
+        ] | @tsv
+    ')
+
+    while IFS=$'\t' read -r vm_name new_ip new_ip6 ssh_port start_port end_port; do
+        [ -z "$vm_name" ] && continue
+        apply_vm_rule_record "$vm_name" "$new_ip" "$new_ip6" "$ssh_port" "$start_port" "$end_port" || true
+    done <<< "$records"
 
     _info "所有规则更新完成"
 }
 
 main() {
     check_root
+    ensure_kubectl
+    ensure_jq
 
     if [ $# -eq 0 ]; then
         # 无参数：更新所有 VM

@@ -7,12 +7,13 @@
 #
 # 支持通过环境变量实现无交互删除：
 #
-#   AUTO_YES=y   跳过删除确认提示（FORCE_YES=y 同效）
-#   RMLOG=n      保留 vmlog 中该 VM 的记录（默认删除）
+#   noninteractive=true  跳过删除确认提示
+#   AUTO_YES=y           兼容旧版写法，同 noninteractive=true（FORCE_YES=y 同效）
+#   RMLOG=n              保留 vmlog 中该 VM 的记录（默认删除）
 #
 # 示例：
-#   AUTO_YES=y ./deletevm.sh vm1
-#   AUTO_YES=y RMLOG=n ./deletevm.sh vm1
+#   noninteractive=true ./deletevm.sh vm1
+#   noninteractive=true RMLOG=n ./deletevm.sh vm1
 #
 # =====================================================================
 
@@ -40,6 +41,31 @@ check_root() {
     if [ "$(id -u)" != "0" ]; then
         _error "请以 root 权限运行此脚本"
     fi
+}
+
+_is_truthy() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|y|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_is_noninteractive() {
+    _is_truthy "${noninteractive:-}" || \
+    _is_truthy "${NONINTERACTIVE:-}" || \
+    _is_truthy "${AUTO_YES:-}" || \
+    _is_truthy "${FORCE_YES:-}"
+}
+
+ensure_kubectl() {
+    if command -v kubectl >/dev/null 2>&1; then
+        return 0
+    fi
+    if command -v k3s >/dev/null 2>&1; then
+        kubectl() { k3s kubectl "$@"; }
+        return 0
+    fi
+    _error "未找到 kubectl/k3s，请先安装 KubeVirt 环境"
 }
 
 show_usage() {
@@ -177,11 +203,12 @@ main() {
     echo ""
 
     check_root
+    ensure_kubectl
     check_vm_exists
 
     echo ""
     _warn "即将删除虚拟机 '${VM_NAME}' 及其所有数据（磁盘、配置、端口转发规则）"
-    if [ "${FORCE_YES}" != "y" ] && [ "${AUTO_YES}" != "y" ]; then
+    if ! _is_noninteractive; then
         read -rp "确认删除？(y/n): " CONFIRM
         if [ "$CONFIRM" != "y" ] && [ "$CONFIRM" != "Y" ]; then
             _info "已取消删除"

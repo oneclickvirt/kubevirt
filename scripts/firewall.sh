@@ -283,6 +283,9 @@ fw_get_vm_ip6() {
 
 # ===== 获取防火墙后端名称 =====
 fw_backend_name() {
-    detect_fw_backend || echo "none"
-    echo "$FW_BACKEND"
+    if detect_fw_backend; then
+        echo "$FW_BACKEND"
+    else
+        echo "none"
+    fi
 }

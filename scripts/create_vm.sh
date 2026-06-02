@@ -17,12 +17,13 @@
 #   PORT_RANGE_SIZE   每台额外端口数量         默认: 26
 #   EXTRA_PORT_START  额外端口起始值           默认: 35000
 #   SYSTEM            操作系统               默认: ubuntu
-#   AUTO_YES=y        跳过所有确认提示
+#   noninteractive=true  跳过所有确认提示，未提供的参数使用默认值
+#   AUTO_YES=y           兼容旧版写法，同 noninteractive=true
 #
 # 示例：
 #   VM_COUNT=3 CPU=2 MEMORY_GB=2 DISK_GB=20 PASSWORD=MyPass123 \
 #   SSH_START_PORT=25000 PORT_RANGE_SIZE=26 EXTRA_PORT_START=35000 \
-#   SYSTEM=debian AUTO_YES=y bash create_vm.sh
+#   SYSTEM=debian noninteractive=true bash create_vm.sh
 #
 # =====================================================================
 
@@ -53,25 +54,77 @@ check_onevm_script() {
         ONEVM_SCRIPT="./onevm.sh"
     else
         _info "正在下载 onevm.sh..."
-        curl -sSL -o /tmp/onevm.sh https://raw.githubusercontent.com/oneclickvirt/kubevirt/main/scripts/onevm.sh
+        if ! curl -fsSL -o /tmp/onevm.sh https://raw.githubusercontent.com/oneclickvirt/kubevirt/main/scripts/onevm.sh; then
+            _error "下载 onevm.sh 失败，请检查网络连接"
+        fi
         chmod +x /tmp/onevm.sh
         ONEVM_SCRIPT="/tmp/onevm.sh"
     fi
     _info "使用脚本：$ONEVM_SCRIPT"
 }
 
-# ===== 是否处于无交互模式（所有参数均由环境变量提供）=====
+# ===== 无交互模式判断 =====
+_is_truthy() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|y|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 _is_noninteractive() {
-    [ "${AUTO_YES}" = "y" ] || \
+    _is_truthy "${noninteractive:-}" || \
+    _is_truthy "${NONINTERACTIVE:-}" || \
+    _is_truthy "${AUTO_YES:-}" || \
+    _is_truthy "${FORCE_YES:-}" || \
     ( [ -n "${VM_COUNT+x}" ] && [ -n "${VM_PREFIX+x}" ] && \
       [ -n "${CPU+x}" ] && [ -n "${MEMORY_GB+x}" ] && \
       [ -n "${DISK_GB+x}" ] && [ -n "${PASSWORD+x}" ] && \
       [ -n "${SSH_START_PORT+x}" ] && [ -n "${SYSTEM+x}" ] )
 }
 
+_validate_uint_range() {
+    local name="$1" value="$2" min="$3" max="$4"
+    if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$value" -lt "$min" ] || [ "$value" -gt "$max" ]; then
+        _error "${name} 无效：${value}（必须在 ${min}-${max} 范围内）"
+    fi
+}
+
+_ranges_overlap() {
+    local start_a="$1" end_a="$2" start_b="$3" end_b="$4"
+    [ "$start_a" -le "$end_b" ] && [ "$start_b" -le "$end_a" ]
+}
+
+validate_params() {
+    _validate_uint_range "虚拟机数量" "$VM_COUNT" 1 9999
+    _validate_uint_range "起始编号" "$START_NUM" 0 999999
+    _validate_uint_range "CPU 核数" "$CPU" 1 256
+    _validate_uint_range "内存" "$MEMORY_GB" 1 1048576
+    _validate_uint_range "磁盘" "$DISK_GB" 1 1048576
+    _validate_uint_range "SSH 起始端口" "$SSH_START_PORT" 1 65535
+    _validate_uint_range "额外端口范围大小" "$PORT_RANGE_SIZE" 0 65535
+
+    local ssh_end=$((SSH_START_PORT + VM_COUNT - 1))
+    if [ "$ssh_end" -gt 65535 ]; then
+        _error "SSH 端口范围越界：${SSH_START_PORT}-${ssh_end}"
+    fi
+
+    if [ "$PORT_RANGE_SIZE" -gt 0 ]; then
+        _validate_uint_range "额外端口起始值" "$EXTRA_PORT_START" 1 65535
+        local extra_end=$((EXTRA_PORT_START + VM_COUNT * PORT_RANGE_SIZE - 1))
+        if [ "$extra_end" -gt 65535 ]; then
+            _error "额外端口范围越界：${EXTRA_PORT_START}-${extra_end}"
+        fi
+        if _ranges_overlap "$SSH_START_PORT" "$ssh_end" "$EXTRA_PORT_START" "$extra_end"; then
+            _error "SSH 端口范围 ${SSH_START_PORT}-${ssh_end} 与额外端口范围 ${EXTRA_PORT_START}-${extra_end} 重叠"
+        fi
+    else
+        EXTRA_PORT_START="${EXTRA_PORT_START:-0}"
+    fi
+}
+
 # ===== 交互式参数收集（若环境变量已设置则使用环境变量，跳过 read）=====
 collect_params() {
-    # 若 AUTO_YES=y 且所有必要变量已设置，无需打印菜单
+    # 无交互模式下无需打印菜单
     if ! _is_noninteractive; then
         echo ""
         echo "======================================================"
@@ -81,7 +134,7 @@ collect_params() {
     fi
 
     # ----- 数量 -----
-    if [ -z "${VM_COUNT+x}" ]; then
+    if [ -z "${VM_COUNT+x}" ] && ! _is_noninteractive; then
         read -rp "请输入虚拟机数量 [默认: 1]: " VM_COUNT
     fi
     VM_COUNT="${VM_COUNT:-1}"
@@ -90,7 +143,7 @@ collect_params() {
     fi
 
     # ----- 名称前缀 -----
-    if [ -z "${VM_PREFIX+x}" ]; then
+    if [ -z "${VM_PREFIX+x}" ] && ! _is_noninteractive; then
         read -rp "请输入虚拟机名称前缀 [默认: vm]: " VM_PREFIX
     fi
     VM_PREFIX="${VM_PREFIX:-vm}"
@@ -99,31 +152,31 @@ collect_params() {
     fi
 
     # ----- 起始编号 -----
-    if [ -z "${START_NUM+x}" ]; then
+    if [ -z "${START_NUM+x}" ] && ! _is_noninteractive; then
         read -rp "请输入起始编号 [默认: 1]: " START_NUM
     fi
     START_NUM="${START_NUM:-1}"
 
     # ----- CPU -----
-    if [ -z "${CPU+x}" ]; then
+    if [ -z "${CPU+x}" ] && ! _is_noninteractive; then
         read -rp "请输入每台虚拟机 CPU 核数 [默认: 1]: " CPU
     fi
     CPU="${CPU:-1}"
 
     # ----- 内存 -----
-    if [ -z "${MEMORY_GB+x}" ]; then
+    if [ -z "${MEMORY_GB+x}" ] && ! _is_noninteractive; then
         read -rp "请输入每台虚拟机内存（GB）[默认: 1]: " MEMORY_GB
     fi
     MEMORY_GB="${MEMORY_GB:-1}"
 
     # ----- 磁盘 -----
-    if [ -z "${DISK_GB+x}" ]; then
+    if [ -z "${DISK_GB+x}" ] && ! _is_noninteractive; then
         read -rp "请输入每台虚拟机磁盘大小（GB）[默认: 10]: " DISK_GB
     fi
     DISK_GB="${DISK_GB:-10}"
 
     # ----- 密码 -----
-    if [ -z "${PASSWORD+x}" ]; then
+    if [ -z "${PASSWORD+x}" ] && ! _is_noninteractive; then
         read -rp "请输入 root 密码 [默认: 随机生成]: " PASSWORD
     fi
     if [ -z "$PASSWORD" ]; then
@@ -133,27 +186,28 @@ collect_params() {
     fi
 
     # ----- SSH 起始端口 -----
-    if [ -z "${SSH_START_PORT+x}" ]; then
+    if [ -z "${SSH_START_PORT+x}" ] && ! _is_noninteractive; then
         read -rp "请输入 SSH 起始端口 [默认: 25000]: " SSH_START_PORT
     fi
     SSH_START_PORT="${SSH_START_PORT:-25000}"
 
     # ----- 额外端口范围大小 -----
-    if [ -z "${PORT_RANGE_SIZE+x}" ]; then
+    if [ -z "${PORT_RANGE_SIZE+x}" ] && ! _is_noninteractive; then
         read -rp "请输入每台 VM 的额外端口范围大小（0=不分配）[默认: 26]: " PORT_RANGE_SIZE
     fi
     PORT_RANGE_SIZE="${PORT_RANGE_SIZE:-26}"
+    _validate_uint_range "额外端口范围大小" "$PORT_RANGE_SIZE" 0 65535
 
     # ----- 额外端口起始值 -----
     if [ "$PORT_RANGE_SIZE" -gt 0 ]; then
-        if [ -z "${EXTRA_PORT_START+x}" ]; then
+        if [ -z "${EXTRA_PORT_START+x}" ] && ! _is_noninteractive; then
             read -rp "请输入额外端口起始值 [默认: 35000]: " EXTRA_PORT_START
         fi
         EXTRA_PORT_START="${EXTRA_PORT_START:-35000}"
     fi
 
     # ----- 操作系统 -----
-    if [ -z "${SYSTEM+x}" ]; then
+    if [ -z "${SYSTEM+x}" ] && ! _is_noninteractive; then
         echo ""
         echo "可选操作系统："
         echo "  1) ubuntu       - Ubuntu 22.04 LTS"
@@ -165,12 +219,13 @@ collect_params() {
         echo "  7) centos8-stream - CentOS Stream 8"
         echo "  8) centos-stream  - CentOS Stream 9"
         echo "  9) opensuse     - openSUSE Leap 15.5"
+        echo "  10) ubuntu24    - Ubuntu 24.04 LTS"
         echo ""
         echo "  镜像优先从 oneclickvirt/pve_kvm_images 和 oneclickvirt/kvm_images 获取"
         read -rp "请选择系统编号或输入系统名称 [默认: 1/ubuntu]: " SYSTEM_INPUT
         SYSTEM_INPUT="${SYSTEM_INPUT:-1}"
     else
-        SYSTEM_INPUT="${SYSTEM}"
+        SYSTEM_INPUT="${SYSTEM:-ubuntu}"
     fi
 
     case "$SYSTEM_INPUT" in
@@ -183,8 +238,11 @@ collect_params() {
         7|centos8-stream|centos8) SYSTEM="centos8-stream" ;;
         8|centos-stream|centos9)  SYSTEM="centos-stream" ;;
         9|opensuse)      SYSTEM="opensuse" ;;
+        10|ubuntu24|ubuntu2404) SYSTEM="ubuntu24" ;;
         *) _error "无效的系统选择：$SYSTEM_INPUT" ;;
     esac
+
+    validate_params
 
     # ----- 配置预览 -----
     echo ""
@@ -205,7 +263,7 @@ collect_params() {
     echo ""
 
     # ----- 最终确认 -----
-    if [ "${AUTO_YES}" != "y" ]; then
+    if ! _is_noninteractive; then
         read -rp "确认创建？(y/n): " CONFIRM
         if [ "$CONFIRM" != "y" ] && [ "$CONFIRM" != "Y" ]; then
             _info "已取消"
@@ -222,13 +280,13 @@ check_disk_space() {
 
     if [ "$available_gb" -lt "$required_gb" ]; then
         _warn "可用磁盘空间 ${available_gb}GB 可能不足（需要约 ${required_gb}GB）"
-        if [ "${AUTO_YES}" != "y" ]; then
+        if ! _is_noninteractive; then
             read -rp "是否继续？(y/n): " cont
             if [ "$cont" != "y" ] && [ "$cont" != "Y" ]; then
                 exit 0
             fi
         else
-            _warn "AUTO_YES=y，忽略磁盘空间警告，继续执行..."
+            _warn "noninteractive=true，忽略磁盘空间警告，继续执行..."
         fi
     fi
 }

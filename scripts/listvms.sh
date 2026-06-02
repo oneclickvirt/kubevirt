@@ -33,8 +33,16 @@ show_usage() {
 }
 
 check_kubectl() {
-    if ! command -v kubectl >/dev/null 2>&1 && ! command -v k3s >/dev/null 2>&1; then
-        echo "错误：未找到 kubectl/k3s，请先安装 KubeVirt 环境"
+    if ! command -v kubectl >/dev/null 2>&1; then
+        if command -v k3s >/dev/null 2>&1; then
+            kubectl() { k3s kubectl "$@"; }
+        else
+            echo "错误：未找到 kubectl/k3s，请先安装 KubeVirt 环境"
+            exit 1
+        fi
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "错误：未找到 jq，请先安装依赖或重新运行安装脚本"
         exit 1
     fi
     if ! kubectl get namespace "$NS" >/dev/null 2>&1; then
@@ -43,22 +51,33 @@ check_kubectl() {
     fi
 }
 
+get_json_or_empty_list() {
+    local resource="$1"
+    kubectl get "$resource" -n "$NS" -o json 2>/dev/null || printf '{"items":[]}\n'
+}
+
+get_json_or_empty_object() {
+    kubectl "$@" -o json 2>/dev/null || printf '{}\n'
+}
+
 # ===== 获取宿主机 IP =====
 get_host_ip() {
-    HOST_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' \
-        || hostname -I | awk '{print $1}' \
-        || echo "<宿主机IP>")
+    HOST_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')
+    if [ -z "$HOST_IP" ]; then
+        HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+    fi
+    HOST_IP="${HOST_IP:-<宿主机IP>}"
 }
 
 # ===== 列出所有虚拟机 =====
 list_all_vms() {
     local verbose="${1:-}"
+    local vm_json vmi_json dv_json vm_count
 
-    #— 获取 VM 列表
-    local vm_list
-    vm_list=$(kubectl get vm -n "$NS" --no-headers 2>/dev/null)
+    vm_json=$(get_json_or_empty_list vm)
+    vm_count=$(printf '%s' "$vm_json" | jq '.items | length')
 
-    if [ -z "$vm_list" ]; then
+    if [ "$vm_count" -eq 0 ]; then
         echo ""
         _warn "当前没有虚拟机。"
         echo ""
@@ -69,6 +88,9 @@ list_all_vms() {
         return
     fi
 
+    vmi_json=$(get_json_or_empty_list vmi)
+    dv_json=$(get_json_or_empty_list datavolume)
+
     get_host_ip
 
     echo ""
@@ -78,34 +100,12 @@ list_all_vms() {
     _header "======================================================"
     echo ""
     printf "%-15s %-10s %-12s %-8s %-10s %-12s\n" \
-        "名称" "状态" "VMI状态" "CPU" "内存" "SSH端口"
+        "名称" "Ready" "VMI状态" "CPU" "内存" "SSH端口"
     echo "-----------------------------------------------------------------------"
 
-    while IFS= read -r line; do
-        local vm_name
-        vm_name=$(echo "$line" | awk '{print $1}')
-        local vm_ready
-        vm_ready=$(echo "$line" | awk '{print $2}')
-        local vm_status
-        vm_status=$(echo "$line" | awk '{print $3}')
+    while IFS=$'\t' read -r vm_name vm_ready vm_status vmi_phase ssh_port cpu_cores memory vm_ip start_port end_port system disk; do
+        [ -z "$vm_name" ] && continue
 
-        # 获取 VMI 状态
-        local vmi_phase
-        vmi_phase=$(kubectl get vmi "$vm_name" -n "$NS" \
-            -o jsonpath='{.status.phase}' 2>/dev/null || echo "Stopped")
-
-        # 获取资源信息（从注解）
-        local ssh_port
-        ssh_port=$(kubectl get vm "$vm_name" -n "$NS" \
-            -o jsonpath='{.metadata.annotations.kubevirt\.io/ssh-port}' 2>/dev/null || echo "?")
-        local cpu_cores
-        cpu_cores=$(kubectl get vm "$vm_name" -n "$NS" \
-            -o jsonpath='{.spec.template.spec.domain.cpu.cores}' 2>/dev/null || echo "?")
-        local memory
-        memory=$(kubectl get vm "$vm_name" -n "$NS" \
-            -o jsonpath='{.spec.template.spec.domain.memory.guest}' 2>/dev/null || echo "?")
-
-        # 状态颜色
         local status_str
         case "$vmi_phase" in
             Running)  status_str="${GREEN}Running${NC}" ;;
@@ -115,28 +115,12 @@ list_all_vms() {
             *)        status_str="${NC}${vmi_phase}${NC}" ;;
         esac
 
-        printf "%-15s %-10s " "$vm_name" "$(echo "$vm_ready" | tr -d '\n')"
+        printf "%-15s %-10s " "$vm_name" "$vm_ready"
         echo -e "${status_str}$(printf '%-6s' '') ${cpu_cores}核     ${memory}       ${ssh_port}"
 
         if [ -n "$verbose" ]; then
-            # 详细信息
-            local vm_ip
-            vm_ip=$(kubectl get vmi "$vm_name" -n "$NS" \
-                -o jsonpath='{.status.interfaces[0].ipAddress}' 2>/dev/null || echo "N/A")
-            local start_port
-            start_port=$(kubectl get vm "$vm_name" -n "$NS" \
-                -o jsonpath='{.metadata.annotations.kubevirt\.io/start-port}' 2>/dev/null || echo "?")
-            local end_port
-            end_port=$(kubectl get vm "$vm_name" -n "$NS" \
-                -o jsonpath='{.metadata.annotations.kubevirt\.io/end-port}' 2>/dev/null || echo "?")
-            local system
-            system=$(kubectl get vm "$vm_name" -n "$NS" \
-                -o jsonpath='{.metadata.labels.vm-system}' 2>/dev/null || echo "?")
-            local disk
-            disk=$(kubectl get datavolume "${vm_name}-dv" -n "$NS" \
-                -o jsonpath='{.spec.storage.resources.requests.storage}' 2>/dev/null || echo "?")
-
             echo "  ├─ 内网 IP:  ${vm_ip}"
+            echo "  ├─ VM 状态:  ${vm_status}"
             echo "  ├─ 系统:     ${system}"
             echo "  ├─ 磁盘:     ${disk}"
             echo "  ├─ 端口范围: ${start_port}-${end_port}"
@@ -145,11 +129,31 @@ list_all_vms() {
             fi
             echo ""
         fi
-
-    done <<< "$vm_list"
+    done < <(
+        printf '%s' "$vm_json" | jq -r --argjson vmis "$vmi_json" --argjson dvs "$dv_json" '
+            .items[] as $vm |
+            ($vm.metadata.name // "") as $name |
+            ([ $vmis.items[]? | select(.metadata.name == $name) ][0] // {}) as $vmi |
+            ([ $dvs.items[]? | select(.metadata.name == ($name + "-dv")) ][0] // {}) as $dv |
+            [
+              $name,
+              ($vm.status.ready // false | tostring),
+              ($vm.status.printableStatus // "-"),
+              ($vmi.status.phase // "Stopped"),
+              ($vm.metadata.annotations["kubevirt.io/ssh-port"] // "?"),
+              ($vm.spec.template.spec.domain.cpu.cores // "?" | tostring),
+              ($vm.spec.template.spec.domain.memory.guest // "?"),
+              ($vmi.status.interfaces[0].ipAddress // "N/A"),
+              ($vm.metadata.annotations["kubevirt.io/start-port"] // "?"),
+              ($vm.metadata.annotations["kubevirt.io/end-port"] // "?"),
+              ($vm.metadata.labels["vm-system"] // "?"),
+              ($dv.spec.storage.resources.requests.storage // "?")
+            ] | @tsv
+        '
+    )
 
     echo ""
-    echo "共 $(echo "$vm_list" | wc -l) 台虚拟机"
+    echo "共 ${vm_count} 台虚拟机"
 
     # 显示 vmlog 摘要（如果存在）
     if [ -f "vmlog" ] && [ -s "vmlog" ]; then
@@ -163,11 +167,14 @@ list_all_vms() {
 # ===== 查看单个 VM 详情 =====
 show_vm_detail() {
     local vm_name="$1"
+    local vm_json vmi_json dv_json detail_line
 
-    if ! kubectl get vm "$vm_name" -n "$NS" >/dev/null 2>&1; then
+    if ! vm_json=$(kubectl get vm "$vm_name" -n "$NS" -o json 2>/dev/null); then
         echo "错误：虚拟机 '$vm_name' 不存在"
         exit 1
     fi
+    vmi_json=$(get_json_or_empty_object get vmi "$vm_name" -n "$NS")
+    dv_json=$(get_json_or_empty_object get datavolume "${vm_name}-dv" -n "$NS")
 
     get_host_ip
 
@@ -177,48 +184,25 @@ show_vm_detail() {
     _header "======================================================"
     echo ""
 
-    # 基础信息
-    local vm_status
-    vm_status=$(kubectl get vm "$vm_name" -n "$NS" \
-        -o jsonpath='{.status.printableStatus}' 2>/dev/null)
-    local vmi_phase
-    vmi_phase=$(kubectl get vmi "$vm_name" -n "$NS" \
-        -o jsonpath='{.status.phase}' 2>/dev/null || echo "Not Running")
-    local vm_ip
-    vm_ip=$(kubectl get vmi "$vm_name" -n "$NS" \
-        -o jsonpath='{.status.interfaces[0].ipAddress}' 2>/dev/null || echo "N/A")
-    local cpu_cores
-    cpu_cores=$(kubectl get vm "$vm_name" -n "$NS" \
-        -o jsonpath='{.spec.template.spec.domain.cpu.cores}' 2>/dev/null || echo "?")
-    local memory
-    memory=$(kubectl get vm "$vm_name" -n "$NS" \
-        -o jsonpath='{.spec.template.spec.domain.memory.guest}' 2>/dev/null || echo "?")
-    local ssh_port
-    ssh_port=$(kubectl get vm "$vm_name" -n "$NS" \
-        -o jsonpath='{.metadata.annotations.kubevirt\.io/ssh-port}' 2>/dev/null || echo "?")
-    local start_port
-    start_port=$(kubectl get vm "$vm_name" -n "$NS" \
-        -o jsonpath='{.metadata.annotations.kubevirt\.io/start-port}' 2>/dev/null || echo "?")
-    local end_port
-    end_port=$(kubectl get vm "$vm_name" -n "$NS" \
-        -o jsonpath='{.metadata.annotations.kubevirt\.io/end-port}' 2>/dev/null || echo "?")
-    local password
-    password=$(kubectl get vm "$vm_name" -n "$NS" \
-        -o jsonpath='{.metadata.annotations.kubevirt\.io/password}' 2>/dev/null || echo "?")
-    local system
-    system=$(kubectl get vm "$vm_name" -n "$NS" \
-        -o jsonpath='{.metadata.labels.vm-system}' 2>/dev/null || echo "?")
-
-    # 磁盘信息
-    local dv_phase
-    dv_phase=$(kubectl get datavolume "${vm_name}-dv" -n "$NS" \
-        -o jsonpath='{.status.phase}' 2>/dev/null || echo "N/A")
-    local dv_progress
-    dv_progress=$(kubectl get datavolume "${vm_name}-dv" -n "$NS" \
-        -o jsonpath='{.status.progress}' 2>/dev/null || echo "N/A")
-    local disk_size
-    disk_size=$(kubectl get datavolume "${vm_name}-dv" -n "$NS" \
-        -o jsonpath='{.spec.storage.resources.requests.storage}' 2>/dev/null || echo "?")
+    local vm_status vmi_phase vm_ip cpu_cores memory ssh_port start_port end_port password system dv_phase dv_progress disk_size
+    detail_line=$(printf '%s' "$vm_json" | jq -r --argjson vmi "$vmi_json" --argjson dv "$dv_json" '
+        [
+          (.status.printableStatus // "-"),
+          ($vmi.status.phase // "Not Running"),
+          ($vmi.status.interfaces[0].ipAddress // "N/A"),
+          (.spec.template.spec.domain.cpu.cores // "?" | tostring),
+          (.spec.template.spec.domain.memory.guest // "?"),
+          (.metadata.annotations["kubevirt.io/ssh-port"] // "?"),
+          (.metadata.annotations["kubevirt.io/start-port"] // "?"),
+          (.metadata.annotations["kubevirt.io/end-port"] // "?"),
+          (.metadata.annotations["kubevirt.io/password"] // "?"),
+          (.metadata.labels["vm-system"] // "?"),
+          ($dv.status.phase // "N/A"),
+          ($dv.status.progress // "N/A"),
+          ($dv.spec.storage.resources.requests.storage // "?")
+        ] | @tsv
+    ')
+    IFS=$'\t' read -r vm_status vmi_phase vm_ip cpu_cores memory ssh_port start_port end_port password system dv_phase dv_progress disk_size <<< "$detail_line"
 
     echo "  名称:         ${vm_name}"
     echo "  VM 状态:      ${vm_status}"

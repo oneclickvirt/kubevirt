@@ -7,11 +7,12 @@
 #
 # 支持通过环境变量实现完全无交互卸载：
 #
-#   AUTO_YES=y   跳过所有确认提示，直接执行卸载
-#   FORCE_YES=y  同 AUTO_YES=y（兼容旧版写法）
+#   noninteractive=true  跳过所有确认提示，直接执行卸载
+#   AUTO_YES=y           兼容旧版写法，同 noninteractive=true
+#   FORCE_YES=y          同 AUTO_YES=y
 #
 # 示例（一键静默卸载）：
-#   AUTO_YES=y bash kubevirtuninstall.sh
+#   noninteractive=true bash kubevirtuninstall.sh
 #
 # =====================================================================
 
@@ -39,9 +40,34 @@ check_root() {
     fi
 }
 
+_is_truthy() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|y|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_is_noninteractive() {
+    _is_truthy "${noninteractive:-}" || \
+    _is_truthy "${NONINTERACTIVE:-}" || \
+    _is_truthy "${AUTO_YES:-}" || \
+    _is_truthy "${FORCE_YES:-}"
+}
+
+ensure_kubectl() {
+    if command -v kubectl >/dev/null 2>&1; then
+        return 0
+    fi
+    if command -v k3s >/dev/null 2>&1; then
+        kubectl() { k3s kubectl "$@"; }
+        return 0
+    fi
+    return 1
+}
+
 # ===== 确认操作 =====
 confirm_uninstall() {
-    if [ "${FORCE_YES}" = "y" ] || [ "${AUTO_YES}" = "y" ]; then
+    if _is_noninteractive; then
         return 0
     fi
     echo ""
@@ -347,6 +373,7 @@ main() {
 
     check_root
     confirm_uninstall
+    ensure_kubectl || true
     stop_all_vms
     uninstall_kubevirt
     uninstall_cdi

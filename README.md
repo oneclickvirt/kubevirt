@@ -12,7 +12,7 @@
 - 使用 KubeVirt 提供虚拟机能力（基于 KVM/QEMU）
 - 使用 CDI（Containerized Data Importer）导入云镜像
 - 通过 NodePort Service + iptables DNAT 实现端口映射
-- 支持系统：Ubuntu 22.04, Debian 12, AlmaLinux 9, RockyLinux 9, CentOS Stream 9, openSUSE Leap 15.5
+- 支持系统：Ubuntu 22.04/24.04, Debian 11/12, AlmaLinux 9, RockyLinux 9, CentOS 7, CentOS Stream 8/9, openSUSE Leap 15.5
 - 支持架构：amd64 (x86_64)
 - 宿主机系统支持：Ubuntu 20.04/22.04/24.04，Debian 11/12
 
@@ -26,6 +26,7 @@
 ## 安装 KubeVirt 环境
 
 ```bash
+export noninteractive=true
 bash <(curl -sSL https://raw.githubusercontent.com/oneclickvirt/kubevirt/main/kubevirtinstall.sh)
 ```
 
@@ -56,7 +57,7 @@ chmod +x onevm.sh
 | 系统标识 | 说明 | 镜像来源 |
 |----------|------|----------|
 | `ubuntu` | Ubuntu 22.04 LTS | pve_kvm_images(ubuntu22) → kvm_images(ubuntu22) → 官方 |
-| `ubuntu24` | Ubuntu 24.04 LTS | pve_kvm_images(ubuntu22) → kvm_images(ubuntu22) → 官方 |
+| `ubuntu24` | Ubuntu 24.04 LTS | pve_kvm_images(ubuntu24) → kvm_images(ubuntu24) → 官方 |
 | `debian` | Debian 12 | pve_kvm_images(debian12) → kvm_images(debian12) → 官方 |
 | `debian11` | Debian 11 | pve_kvm_images(debian11) → kvm_images(debian11) → 官方 |
 | `almalinux` | AlmaLinux 9 | pve_kvm_images(almalinux9) → kvm_images(almalinux9) → 官方 |
@@ -77,6 +78,7 @@ chmod +x onevm.sh
 ```bash
 curl -sSL -o create_vm.sh https://raw.githubusercontent.com/oneclickvirt/kubevirt/main/scripts/create_vm.sh
 chmod +x create_vm.sh
+export noninteractive=true
 ./create_vm.sh
 ```
 
@@ -93,12 +95,14 @@ chmod +x listvms.sh
 ```bash
 curl -sSL -o deletevm.sh https://raw.githubusercontent.com/oneclickvirt/kubevirt/main/scripts/deletevm.sh
 chmod +x deletevm.sh
+export noninteractive=true
 ./deletevm.sh <name>
 ```
 
 ## 卸载（完整清理）
 
 ```bash
+export noninteractive=true
 bash <(curl -sSL https://raw.githubusercontent.com/oneclickvirt/kubevirt/main/kubevirtuninstall.sh)
 ```
 

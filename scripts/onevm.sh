@@ -7,6 +7,7 @@
 #
 # 也可通过环境变量提供参数（命令行参数优先）：
 #
+#   noninteractive=true  统一无交互标记（本脚本本身不读取交互输入）
 #   VM_NAME      虚拟机名称      （必须或位置参数1）
 #   CPU          CPU 核数        默认: 1
 #   MEMORY_GB    内存（GB）       默认: 1
@@ -36,6 +37,25 @@ _info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
 _warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 _error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 _step()  { echo -e "${BLUE}[STEP]${NC} $*"; }
+
+_validate_uint_range() {
+    local name="$1" value="$2" min="$3" max="$4"
+    if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$value" -lt "$min" ] || [ "$value" -gt "$max" ]; then
+        _error "${name} 无效：${value}（必须在 ${min}-${max} 范围内）"
+    fi
+}
+
+_port_in_range() {
+    local port="$1" start="$2" end="$3"
+    [ "$start" != "0" ] && [ "$end" != "0" ] && [ "$port" -ge "$start" ] && [ "$port" -le "$end" ]
+}
+
+_ranges_overlap() {
+    local start_a="$1" end_a="$2" start_b="$3" end_b="$4"
+    [ "$start_a" != "0" ] && [ "$end_a" != "0" ] && \
+    [ "$start_b" != "0" ] && [ "$end_b" != "0" ] && \
+    [ "$start_a" -le "$end_b" ] && [ "$start_b" -le "$end_a" ]
+}
 
 # ===== 环境变量 =====
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
@@ -68,12 +88,10 @@ parse_args() {
         _error "VM 名称只允许小写字母、数字和连字符，且不能以连字符开头或结尾：$VM_NAME"
     fi
 
-    # 验证端口
-    for port in "$SSH_PORT"; do
-        if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-            _error "端口无效：$port（必须在 1-65535 范围内）"
-        fi
-    done
+    _validate_uint_range "CPU 核数" "$CPU" 1 256
+    _validate_uint_range "内存" "$MEMORY_GB" 1 1048576
+    _validate_uint_range "磁盘" "$DISK_GB" 1 1048576
+    _validate_uint_range "SSH 端口" "$SSH_PORT" 1 65535
 
     # 允许 startport/endport 为 0（表示不分配额外端口）
     if [ "$START_PORT" != "0" ] || [ "$END_PORT" != "0" ]; then
@@ -82,14 +100,15 @@ parse_args() {
             _error "起始端口和结束端口必须同时为 0 或同时非零"
         fi
         for port in "$START_PORT" "$END_PORT"; do
-            if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 0 ] || [ "$port" -gt 65535 ]; then
-                _error "端口无效：$port（必须在 0-65535 范围内，0 表示不分配）"
-            fi
+            _validate_uint_range "端口" "$port" 0 65535
         done
     fi
 
     if [ "$START_PORT" -gt "$END_PORT" ]; then
         _error "起始端口 ($START_PORT) 不能大于结束端口 ($END_PORT)"
+    fi
+    if _port_in_range "$SSH_PORT" "$START_PORT" "$END_PORT"; then
+        _error "SSH 端口 ${SSH_PORT} 不能落在额外端口范围 ${START_PORT}-${END_PORT} 内"
     fi
 
     _info "虚拟机配置："
@@ -133,8 +152,81 @@ check_prerequisites() {
         _warn "端口 $SSH_PORT 在宿主机上已被占用，可能导致冲突"
     fi
 
+    check_port_conflicts
+
     # 检测 KVM / 模拟模式
     _detect_emulation_mode
+}
+
+_check_port_record() {
+    local source="$1" existing_name="$2" existing_ssh="$3" existing_start="${4:-0}" existing_end="${5:-0}"
+
+    [ -z "$existing_name" ] && return 0
+    [ "$existing_name" = "$VM_NAME" ] && return 0
+    existing_ssh="${existing_ssh:-0}"
+    existing_start="${existing_start:-0}"
+    existing_end="${existing_end:-0}"
+    [[ "$existing_ssh" =~ ^[0-9]+$ ]] || existing_ssh=0
+    [[ "$existing_start" =~ ^[0-9]+$ ]] || existing_start=0
+    [[ "$existing_end" =~ ^[0-9]+$ ]] || existing_end=0
+
+    if [ "$existing_ssh" -gt 0 ] && [ "$SSH_PORT" -eq "$existing_ssh" ]; then
+        _error "SSH 端口 ${SSH_PORT} 已被虚拟机 ${existing_name} 使用（来源：${source}）"
+    fi
+    if _port_in_range "$SSH_PORT" "$existing_start" "$existing_end"; then
+        _error "SSH 端口 ${SSH_PORT} 与虚拟机 ${existing_name} 的额外端口范围 ${existing_start}-${existing_end} 冲突（来源：${source}）"
+    fi
+    if [ "$existing_ssh" -gt 0 ] && _port_in_range "$existing_ssh" "$START_PORT" "$END_PORT"; then
+        _error "额外端口范围 ${START_PORT}-${END_PORT} 包含虚拟机 ${existing_name} 的 SSH 端口 ${existing_ssh}（来源：${source}）"
+    fi
+    if _ranges_overlap "$START_PORT" "$END_PORT" "$existing_start" "$existing_end"; then
+        _error "额外端口范围 ${START_PORT}-${END_PORT} 与虚拟机 ${existing_name} 的端口范围 ${existing_start}-${existing_end} 重叠（来源：${source}）"
+    fi
+}
+
+check_port_conflicts() {
+    _step "检查端口映射冲突..."
+
+    if [ -f "${KUBEVIRT_PORT_RULES:-}" ]; then
+        while IFS=' ' read -r existing_name _vm_ip existing_ssh existing_start existing_end _vm_ip6; do
+            [[ "$existing_name" =~ ^# || -z "$existing_name" ]] && continue
+            _check_port_record "port-rules.conf" "$existing_name" "$existing_ssh" "$existing_start" "$existing_end"
+        done < "$KUBEVIRT_PORT_RULES"
+    fi
+
+    if command -v jq >/dev/null 2>&1; then
+        local records
+        records=$(kubectl get vm -n "$NS" -o json 2>/dev/null | jq -r '
+            .items[]? |
+            [
+              .metadata.name,
+              (.metadata.annotations["kubevirt.io/ssh-port"] // "0"),
+              (.metadata.annotations["kubevirt.io/start-port"] // "0"),
+              (.metadata.annotations["kubevirt.io/end-port"] // "0")
+            ] | @tsv
+        ' 2>/dev/null || true)
+
+        while IFS=$'\t' read -r existing_name existing_ssh existing_start existing_end; do
+            [ -z "$existing_name" ] && continue
+            _check_port_record "VM 注解" "$existing_name" "$existing_ssh" "$existing_start" "$existing_end"
+        done <<< "$records"
+    else
+        _warn "未找到 jq，跳过基于 VM 注解的端口冲突补充检查"
+    fi
+
+    _info "端口映射冲突检查通过"
+}
+
+get_host_ip() {
+    local host_ip
+    host_ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')
+    if [ -z "$host_ip" ]; then
+        host_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    fi
+    if [ -z "$host_ip" ]; then
+        host_ip=$(curl -s --max-time 5 ifconfig.me 2>/dev/null || true)
+    fi
+    printf '%s\n' "${host_ip:-<宿主机IP>}"
 }
 
 # ===== 检测 KVM 硬件虚拟化或 QEMU TCG 模拟 =====
@@ -191,6 +283,7 @@ get_org_image_ver() {
     local sys="$1"
     case "$sys" in
         ubuntu)         echo "ubuntu22" ;;
+        ubuntu24)       echo "ubuntu24" ;;
         debian)         echo "debian12" ;;
         debian11)       echo "debian11" ;;
         almalinux)      echo "almalinux9" ;;
@@ -271,7 +364,7 @@ get_image_url() {
             ;;
         ubuntu24|ubuntu2404)
             IMAGE_OS="ubuntu"
-            SYSTEM="ubuntu"
+            SYSTEM="ubuntu24"
             official_url="https://cloud-images.ubuntu.com/minimal/releases/noble/release/ubuntu-24.04-minimal-cloudimg-amd64.img"
             ;;
         debian|debian12)
@@ -688,7 +781,7 @@ save_vmlog() {
     local log_file="vmlog"
 
     local HOST_IP
-    HOST_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' || hostname -I | awk '{print $1}')
+    HOST_IP=$(get_host_ip)
 
     local log_line="${VM_NAME} root@${HOST_IP}:${SSH_PORT} 密码: ${PASSWORD} 端口范围: ${START_PORT}-${END_PORT} 系统: ${SYSTEM} CPU: ${CPU}核 内存: ${MEMORY_GB}GB 磁盘: ${DISK_GB}GB"
 
@@ -705,7 +798,11 @@ save_vmlog() {
 wait_for_ssh() {
     _step "等待 SSH 服务就绪（最多 3 分钟）..."
     local HOST_IP
-    HOST_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' || hostname -I | awk '{print $1}')
+    HOST_IP=$(get_host_ip)
+    if [ "$HOST_IP" = "<宿主机IP>" ]; then
+        _warn "无法确定宿主机 IP，跳过 SSH 连通性等待"
+        return 0
+    fi
 
     local timeout=180
     local elapsed=0
@@ -729,9 +826,7 @@ wait_for_ssh() {
 # ===== 输出连接信息 =====
 print_connection_info() {
     local HOST_IP
-    HOST_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' \
-        || hostname -I | awk '{print $1}' \
-        || curl -s ifconfig.me 2>/dev/null || echo "<宿主机IP>")
+    HOST_IP=$(get_host_ip)
 
     echo ""
     echo "======================================================"
