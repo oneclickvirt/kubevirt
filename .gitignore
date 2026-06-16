@@ -4,3 +4,16 @@ vmlog
 *.swp
 *.swo
 *~
+.env
+.env.*
+*.db
+*.sqlite
+*.sqlite3
+*.pem
+*.key
+*password*
+*passwd*
+screenshots/
+*.png
+*.jpg
+*.jpeg

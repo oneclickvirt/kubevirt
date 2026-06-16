@@ -286,6 +286,19 @@ remove_virtctl() {
     _info "virtctl 已删除"
 }
 
+# ===== 删除管理脚本 =====
+remove_management_scripts() {
+    _step "删除 KubeVirt 管理脚本..."
+    rm -f /usr/local/bin/onevm.sh
+    rm -f /usr/local/bin/create_vm.sh
+    rm -f /usr/local/bin/deletevm.sh
+    rm -f /usr/local/bin/listvms.sh
+    rm -f /usr/local/bin/update-port-rules.sh
+    rm -f /usr/local/bin/snapshotvm.sh
+    rm -f /usr/local/bin/resizevm.sh
+    _info "管理脚本已删除"
+}
+
 # ===== 卸载 K3s =====
 uninstall_k3s() {
     _step "卸载 K3s..."
@@ -355,6 +368,7 @@ print_summary() {
     echo "  ✓ CDI 组件"
     echo "  ✓ K3s Kubernetes 集群"
     echo "  ✓ virtctl 工具"
+    echo "  ✓ KubeVirt 管理脚本"
     echo "  ✓ 端口转发规则（nftables/iptables，含持久化规则）"
     echo "  ✓ 相关配置文件"
     echo ""
@@ -380,6 +394,7 @@ main() {
     cleanup_firewall
     cleanup_systemd
     remove_virtctl
+    remove_management_scripts
     uninstall_k3s
     cleanup_files
     cleanup_sysctl

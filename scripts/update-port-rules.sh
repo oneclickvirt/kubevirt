@@ -48,6 +48,13 @@ ensure_jq() {
     fi
 }
 
+validate_vm_name() {
+    local vm_name="$1"
+    if ! echo "$vm_name" | grep -qE '^[a-z0-9][a-z0-9-]*[a-z0-9]$|^[a-z0-9]$'; then
+        _error "VM 名称只允许小写字母、数字和连字符，且不能以连字符开头或结尾：${vm_name}"
+    fi
+}
+
 apply_vm_rule_record() {
     local vm_name="$1" new_ip="$2" new_ip6="${3:--}" ssh_port="$4" start_port="${5:-0}" end_port="${6:-0}"
 
@@ -63,7 +70,10 @@ apply_vm_rule_record() {
 
     _info "更新 $vm_name 的端口转发规则（新IP: $new_ip，后端：$(fw_backend_name)）..."
 
-    fw_add_vm "$vm_name" "$new_ip" "$ssh_port" "$start_port" "$end_port" "$new_ip6"
+    if ! fw_add_vm "$vm_name" "$new_ip" "$ssh_port" "$start_port" "$end_port" "$new_ip6"; then
+        _warn "端口转发规则更新失败：$vm_name"
+        return 1
+    fi
 
     _info "规则更新成功：$vm_name → $new_ip（SSH: $ssh_port, 端口: ${start_port}-${end_port}）"
 }
@@ -71,6 +81,8 @@ apply_vm_rule_record() {
 update_vm_rules() {
     local vm_name="$1"
     local vm_json vmi_json record
+
+    validate_vm_name "$vm_name"
 
     if ! vm_json=$(kubectl get vm "$vm_name" -n "$NS" -o json 2>/dev/null); then
         _error "虚拟机 $vm_name 不存在"

@@ -19,6 +19,13 @@ _header() { echo -e "${BLUE}$*${NC}"; }
 _info()   { echo -e "${GREEN}$*${NC}"; }
 _warn()   { echo -e "${YELLOW}$*${NC}"; }
 
+_is_truthy() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|y|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 show_usage() {
     echo "用法: $0 [vmname] [-v|--verbose]"
     echo ""
@@ -72,7 +79,7 @@ get_host_ip() {
 # ===== 列出所有虚拟机 =====
 list_all_vms() {
     local verbose="${1:-}"
-    local vm_json vmi_json dv_json vm_count
+    local vm_json vmi_json dv_json pvc_json vm_count
 
     vm_json=$(get_json_or_empty_list vm)
     vm_count=$(printf '%s' "$vm_json" | jq '.items | length')
@@ -90,6 +97,7 @@ list_all_vms() {
 
     vmi_json=$(get_json_or_empty_list vmi)
     dv_json=$(get_json_or_empty_list datavolume)
+    pvc_json=$(get_json_or_empty_list pvc)
 
     get_host_ip
 
@@ -130,11 +138,12 @@ list_all_vms() {
             echo ""
         fi
     done < <(
-        printf '%s' "$vm_json" | jq -r --argjson vmis "$vmi_json" --argjson dvs "$dv_json" '
+        printf '%s' "$vm_json" | jq -r --argjson vmis "$vmi_json" --argjson dvs "$dv_json" --argjson pvcs "$pvc_json" '
             .items[] as $vm |
             ($vm.metadata.name // "") as $name |
             ([ $vmis.items[]? | select(.metadata.name == $name) ][0] // {}) as $vmi |
             ([ $dvs.items[]? | select(.metadata.name == ($name + "-dv")) ][0] // {}) as $dv |
+            ([ $pvcs.items[]? | select(.metadata.name == ($name + "-dv")) ][0] // {}) as $pvc |
             [
               $name,
               ($vm.status.ready // false | tostring),
@@ -147,7 +156,13 @@ list_all_vms() {
               ($vm.metadata.annotations["kubevirt.io/start-port"] // "?"),
               ($vm.metadata.annotations["kubevirt.io/end-port"] // "?"),
               ($vm.metadata.labels["vm-system"] // "?"),
-              ($dv.spec.storage.resources.requests.storage // "?")
+              (
+                $pvc.spec.resources.requests.storage //
+                $pvc.status.capacity.storage //
+                $vm.metadata.annotations["kubevirt.io/disk-size"] //
+                $dv.spec.storage.resources.requests.storage //
+                "?"
+              )
             ] | @tsv
         '
     )
@@ -159,7 +174,12 @@ list_all_vms() {
     if [ -f "vmlog" ] && [ -s "vmlog" ]; then
         echo ""
         _header "─── 连接信息摘要（vmlog）───"
-        cat vmlog
+        if _is_truthy "${SHOW_PASSWORD:-}"; then
+            cat vmlog
+        else
+            sed -E 's/(密码: )[^[:space:]]+/\1******/g' vmlog
+            echo "（设置 SHOW_PASSWORD=true 显示 vmlog 中的明文密码）"
+        fi
     fi
     echo ""
 }
@@ -167,7 +187,7 @@ list_all_vms() {
 # ===== 查看单个 VM 详情 =====
 show_vm_detail() {
     local vm_name="$1"
-    local vm_json vmi_json dv_json detail_line
+    local vm_json vmi_json dv_json pvc_json detail_line
 
     if ! vm_json=$(kubectl get vm "$vm_name" -n "$NS" -o json 2>/dev/null); then
         echo "错误：虚拟机 '$vm_name' 不存在"
@@ -175,6 +195,7 @@ show_vm_detail() {
     fi
     vmi_json=$(get_json_or_empty_object get vmi "$vm_name" -n "$NS")
     dv_json=$(get_json_or_empty_object get datavolume "${vm_name}-dv" -n "$NS")
+    pvc_json=$(get_json_or_empty_object get pvc "${vm_name}-dv" -n "$NS")
 
     get_host_ip
 
@@ -184,8 +205,8 @@ show_vm_detail() {
     _header "======================================================"
     echo ""
 
-    local vm_status vmi_phase vm_ip cpu_cores memory ssh_port start_port end_port password system dv_phase dv_progress disk_size
-    detail_line=$(printf '%s' "$vm_json" | jq -r --argjson vmi "$vmi_json" --argjson dv "$dv_json" '
+    local vm_status vmi_phase vm_ip cpu_cores memory ssh_port start_port end_port password password_stored system dv_phase dv_progress disk_size
+    detail_line=$(printf '%s' "$vm_json" | jq -r --argjson vmi "$vmi_json" --argjson dv "$dv_json" --argjson pvc "$pvc_json" '
         [
           (.status.printableStatus // "-"),
           ($vmi.status.phase // "Not Running"),
@@ -196,13 +217,20 @@ show_vm_detail() {
           (.metadata.annotations["kubevirt.io/start-port"] // "?"),
           (.metadata.annotations["kubevirt.io/end-port"] // "?"),
           (.metadata.annotations["kubevirt.io/password"] // "?"),
+          (.metadata.annotations["kubevirt.io/password-stored"] // "true"),
           (.metadata.labels["vm-system"] // "?"),
           ($dv.status.phase // "N/A"),
           ($dv.status.progress // "N/A"),
-          ($dv.spec.storage.resources.requests.storage // "?")
+          (
+            $pvc.spec.resources.requests.storage //
+            $pvc.status.capacity.storage //
+            .metadata.annotations["kubevirt.io/disk-size"] //
+            $dv.spec.storage.resources.requests.storage //
+            "?"
+          )
         ] | @tsv
     ')
-    IFS=$'\t' read -r vm_status vmi_phase vm_ip cpu_cores memory ssh_port start_port end_port password system dv_phase dv_progress disk_size <<< "$detail_line"
+    IFS=$'\t' read -r vm_status vmi_phase vm_ip cpu_cores memory ssh_port start_port end_port password password_stored system dv_phase dv_progress disk_size <<< "$detail_line"
 
     echo "  名称:         ${vm_name}"
     echo "  VM 状态:      ${vm_status}"
@@ -219,6 +247,11 @@ show_vm_detail() {
     echo "    SSH 端口:   ${HOST_IP}:${ssh_port}"
     echo "    额外端口:   ${start_port}-${end_port}"
     echo "    SSH 命令:   ssh root@${HOST_IP} -p ${ssh_port}"
+    if [ "$password" = "?" ] && [ "$password_stored" = "false" ]; then
+        password="未存储（创建时未启用 STORE_PASSWORD_ANNOTATION）"
+    elif [ "$password" != "?" ] && ! _is_truthy "${SHOW_PASSWORD:-}"; then
+        password="******（设置 SHOW_PASSWORD=true 显示）"
+    fi
     echo "    密码:       ${password}"
     echo ""
     echo "  管理命令："

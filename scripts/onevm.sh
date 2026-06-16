@@ -17,6 +17,7 @@
 #   START_PORT   额外端口起始     默认: 34975
 #   END_PORT     额外端口结束     默认: 35000
 #   SYSTEM       操作系统        默认: ubuntu
+#   STORE_PASSWORD_ANNOTATION=true  将明文密码写入 VM 注解（默认不写入）
 #
 # 示例：
 #   ./onevm.sh vm1 2 2 20 MyPass 25000 34975 35000 debian
@@ -25,6 +26,8 @@
 #   bash onevm.sh
 #
 # =====================================================================
+
+set -o pipefail
 
 # ===== 颜色输出 =====
 RED='\033[0;31m'
@@ -43,6 +46,13 @@ _validate_uint_range() {
     if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$value" -lt "$min" ] || [ "$value" -gt "$max" ]; then
         _error "${name} 无效：${value}（必须在 ${min}-${max} 范围内）"
     fi
+}
+
+_is_truthy() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|y|on) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 _port_in_range() {
@@ -486,9 +496,11 @@ runcmd:
   - /tmp/.kubevirt-init.sh
 timezone: Asia/Shanghai"
 
-    kubectl create secret generic "$SECRET_NAME" \
+    if ! kubectl create secret generic "$SECRET_NAME" \
         -n "$NS" \
-        --from-literal=userdata="$user_data"
+        --from-literal=userdata="$user_data"; then
+        _error "cloud-init Secret 创建失败：${SECRET_NAME}"
+    fi
 
     _info "cloud-init 配置已创建"
 }
@@ -504,7 +516,7 @@ create_datavolume() {
     kubectl delete datavolume "$DV_NAME" -n "$NS" 2>/dev/null || true
     sleep 2
 
-    cat <<EOF | kubectl apply -f -
+    if ! cat <<EOF | kubectl apply -f -
 apiVersion: cdi.kubevirt.io/v1beta1
 kind: DataVolume
 metadata:
@@ -525,6 +537,10 @@ spec:
         storage: ${DISK_SIZE}
     storageClassName: local-path
 EOF
+    then
+        cleanup_failed_vm_resources
+        _error "DataVolume ${DV_NAME} 创建失败"
+    fi
 
     _info "DataVolume ${DV_NAME} 创建成功，开始下载镜像..."
     _info "使用 'kubectl get dv ${DV_NAME} -n ${NS}' 查看下载进度"
@@ -539,7 +555,7 @@ create_virtualmachine() {
     local DV_NAME="${VM_NAME}-dv"
     local SECRET_NAME="${VM_NAME}-cloudinit"
 
-    cat <<EOF | kubectl apply -f -
+    if ! cat <<EOF | kubectl apply -f -
 apiVersion: kubevirt.io/v1
 kind: VirtualMachine
 metadata:
@@ -553,7 +569,8 @@ metadata:
     kubevirt.io/ssh-port: "${SSH_PORT}"
     kubevirt.io/start-port: "${START_PORT}"
     kubevirt.io/end-port: "${END_PORT}"
-    kubevirt.io/password: "${PASSWORD}"
+    kubevirt.io/disk-size: "${DISK_GB}Gi"
+    kubevirt.io/password-stored: "false"
 spec:
   running: true
   template:
@@ -595,8 +612,37 @@ spec:
             secretRef:
               name: ${SECRET_NAME}
 EOF
+    then
+        cleanup_failed_vm_resources
+        _error "VirtualMachine ${VM_NAME} 创建失败"
+    fi
+
+    if _is_truthy "${STORE_PASSWORD_ANNOTATION:-}"; then
+        _warn "STORE_PASSWORD_ANNOTATION=true，将明文密码写入 VM 注解"
+        if ! kubectl annotate vm "$VM_NAME" -n "$NS" --overwrite \
+            "kubevirt.io/password=${PASSWORD}" \
+            "kubevirt.io/password-stored=true"; then
+            _error "VirtualMachine ${VM_NAME} 密码注解写入失败"
+        fi
+    fi
 
     _info "VirtualMachine ${VM_NAME} 已创建"
+}
+
+cleanup_failed_vm_resources() {
+    if _is_truthy "${KEEP_FAILED_RESOURCES:-}"; then
+        _warn "KEEP_FAILED_RESOURCES=true，保留失败现场资源用于排查"
+        return 0
+    fi
+
+    _warn "清理本次创建失败残留资源..."
+    kubectl delete vm "$VM_NAME" -n "$NS" --timeout=60s 2>/dev/null || true
+    kubectl delete datavolume "${VM_NAME}-dv" -n "$NS" --timeout=60s 2>/dev/null || true
+    kubectl delete pvc "${VM_NAME}-dv" -n "$NS" --timeout=60s 2>/dev/null || true
+    kubectl delete secret "${VM_NAME}-cloudinit" -n "$NS" 2>/dev/null || true
+    if [ -f "$FIREWALL_LIB" ] && command -v fw_remove_vm >/dev/null 2>&1; then
+        fw_remove_vm "$VM_NAME" 2>/dev/null || true
+    fi
 }
 
 # ===== 等待 DataVolume 导入完成 =====
@@ -627,6 +673,7 @@ wait_for_datavolume() {
             local message
             message=$(kubectl get datavolume "$DV_NAME" -n "$NS" \
                 -o jsonpath='{.status.conditions[*].message}' 2>/dev/null || echo "unknown error")
+            cleanup_failed_vm_resources
             _error "镜像导入失败：$message\n请检查镜像 URL 是否可访问或磁盘空间是否充足"
         fi
 
@@ -641,6 +688,7 @@ wait_for_datavolume() {
         elapsed=$((elapsed + 5))
         if [ "$elapsed" -ge "$timeout" ]; then
             echo ""
+            cleanup_failed_vm_resources
             _error "镜像导入超时（${timeout}秒），请检查网络连接和磁盘空间"
         fi
     done
@@ -651,11 +699,17 @@ start_vm() {
     _step "启动虚拟机..."
 
     if command -v virtctl >/dev/null 2>&1; then
-        virtctl start "$VM_NAME" -n "$NS"
+        if ! virtctl start "$VM_NAME" -n "$NS"; then
+            cleanup_failed_vm_resources
+            _error "virtctl 启动 VM 失败：${VM_NAME}"
+        fi
     else
-        kubectl patch vm "$VM_NAME" -n "$NS" \
+        if ! kubectl patch vm "$VM_NAME" -n "$NS" \
             --type merge \
-            -p '{"spec":{"running":true}}'
+            -p '{"spec":{"running":true}}'; then
+            cleanup_failed_vm_resources
+            _error "kubectl 启动 VM 失败：${VM_NAME}"
+        fi
     fi
 
     _info "虚拟机启动命令已发送"
@@ -676,6 +730,7 @@ wait_for_vmi() {
             _info "虚拟机实例已运行"
             return 0
         elif [ "$phase" = "Failed" ] || [ "$phase" = "Succeeded" ]; then
+            cleanup_failed_vm_resources
             _error "虚拟机实例状态异常：$phase"
         fi
 
@@ -684,6 +739,7 @@ wait_for_vmi() {
         elapsed=$((elapsed + 3))
         if [ "$elapsed" -ge "$timeout" ]; then
             echo ""
+            cleanup_failed_vm_resources
             _error "虚拟机启动超时（${timeout}秒）\n尝试：kubectl describe vmi $VM_NAME -n $NS"
         fi
     done
@@ -761,17 +817,23 @@ setup_port_forward() {
     _step "配置端口转发..."
 
     if [ -z "$VM_IP" ]; then
-        _warn "VM IP 未知，跳过端口转发配置"
-        return 1
+        cleanup_failed_vm_resources
+        _error "VM IP 未知，无法配置端口转发"
     fi
 
-    detect_fw_backend || return 1
+    if ! detect_fw_backend; then
+        cleanup_failed_vm_resources
+        _error "未找到可用防火墙后端，无法配置端口转发"
+    fi
     _info "SSH 端口转发：宿主机:${SSH_PORT} → VM:22（后端：${FW_BACKEND}）"
     if [ "$START_PORT" != "0" ] && [ "$END_PORT" != "0" ]; then
         _info "端口范围转发：宿主机:${START_PORT}-${END_PORT} → VM:${START_PORT}-${END_PORT}"
     fi
 
-    fw_add_vm "$VM_NAME" "$VM_IP" "$SSH_PORT" "$START_PORT" "$END_PORT" "$VM_IP6"
+    if ! fw_add_vm "$VM_NAME" "$VM_IP" "$SSH_PORT" "$START_PORT" "$END_PORT" "$VM_IP6"; then
+        cleanup_failed_vm_resources
+        _error "端口转发规则配置失败：${VM_NAME}"
+    fi
 
     _info "端口转发规则已配置并持久化"
 }
@@ -871,7 +933,10 @@ main() {
     create_virtualmachine
     wait_for_datavolume
     wait_for_vmi
-    get_vm_ip
+    if ! get_vm_ip; then
+        cleanup_failed_vm_resources
+        _error "无法获取虚拟机 IP，无法配置端口转发"
+    fi
     setup_port_forward
     save_vmlog
     wait_for_ssh

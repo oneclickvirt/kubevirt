@@ -12,6 +12,11 @@
 #   KUBEVIRT_VERSION  KubeVirt 版本     默认: v1.2.1
 #   CDI_VERSION       CDI 版本          默认: v1.59.0
 #   VIRTCTL_VERSION   virtctl 版本      默认: v1.2.1
+#   K3S_INSTALL_SCRIPT       本地 K3s 安装脚本路径
+#   KUBEVIRT_MANIFEST_DIR    本地 KubeVirt manifest 目录
+#   CDI_MANIFEST_DIR         本地 CDI manifest 目录
+#   VIRTCTL_BINARY           本地 virtctl 二进制路径
+#   KUBEVIRT_SCRIPT_DIR      本地脚本目录（包含 scripts/*.sh 或 *.sh）
 #
 # 示例（一键无交互安装）：
 #   noninteractive=true bash kubevirtinstall.sh
@@ -21,6 +26,7 @@
 
 # ===== 全局非交互模式 =====
 export DEBIAN_FRONTEND=noninteractive
+set -o pipefail
 
 # ===== 版本配置（支持环境变量覆盖）=====
 K3S_VERSION="${K3S_VERSION:-v1.29.3+k3s1}"
@@ -89,8 +95,10 @@ check_kvm() {
         _warn "/dev/kvm 不存在，KubeVirt 将使用 QEMU TCG 软件模拟（性能较低）"
         USE_EMULATION=1
     else
-        chmod 666 /dev/kvm 2>/dev/null || true
-        _info "KVM 硬件虚拟化可用（嵌套虚拟化或物理机）"
+        if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+            _warn "/dev/kvm 存在但当前 root 会话不可读写，请检查设备权限和内核模块"
+        fi
+        _info "KVM 硬件虚拟化可用（嵌套虚拟化或物理机），不修改 /dev/kvm 权限"
         USE_EMULATION=0
     fi
 }
@@ -123,14 +131,36 @@ install_dependencies() {
             nftables iptables ebtables ipset iproute2 \
             ca-certificates gnupg lsb-release \
             qemu-utils cloud-image-utils \
-            apache2-utils 2>/dev/null || true
+            apache2-utils util-linux 2>/dev/null || true
     elif command -v yum >/dev/null 2>&1; then
         yum install -y -q \
             curl wget git jq socat conntrack-tools \
             nftables iptables ebtables ipset iproute \
-            ca-certificates gnupg qemu-img 2>/dev/null || true
+            ca-certificates gnupg qemu-img util-linux 2>/dev/null || true
     fi
     _info "依赖安装完成"
+}
+
+verify_dependencies() {
+    _step "校验基础命令依赖..."
+
+    local missing=""
+    local cmd
+    for cmd in curl jq ss ip awk sed grep base64 flock; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing="${missing} ${cmd}"
+        fi
+    done
+
+    if ! command -v nft >/dev/null 2>&1 && ! command -v iptables >/dev/null 2>&1; then
+        missing="${missing} nft-or-iptables"
+    fi
+
+    if [ -n "$missing" ]; then
+        _error "基础依赖缺失：${missing}。请检查包管理器、软件源或手动安装后重试"
+    fi
+
+    _info "基础命令依赖校验通过"
 }
 
 # ===== 带重试的下载函数 =====
@@ -151,6 +181,98 @@ download_with_retry() {
     return 1
 }
 
+download_or_error() {
+    local url="$1"
+    local output="$2"
+    local label="$3"
+    if ! download_with_retry "$url" "$output"; then
+        _error "${label} 下载失败：${url}"
+    fi
+}
+
+use_local_or_download() {
+    local url="$1"
+    local output="$2"
+    local label="$3"
+    local local_path="${4:-}"
+
+    if [ -n "$local_path" ]; then
+        if [ ! -f "$local_path" ]; then
+            _error "${label} 本地文件不存在：${local_path}"
+        fi
+        cp "$local_path" "$output"
+        _info "使用本地 ${label}：${local_path}"
+        return 0
+    fi
+
+    download_or_error "$url" "$output" "$label"
+}
+
+find_local_script() {
+    local script_name="$1"
+    local local_path=""
+
+    if [ -n "${KUBEVIRT_SCRIPT_DIR:-}" ]; then
+        if [ -f "${KUBEVIRT_SCRIPT_DIR}/${script_name}" ]; then
+            local_path="${KUBEVIRT_SCRIPT_DIR}/${script_name}"
+        elif [ -f "${KUBEVIRT_SCRIPT_DIR}/scripts/${script_name}" ]; then
+            local_path="${KUBEVIRT_SCRIPT_DIR}/scripts/${script_name}"
+        else
+            return 1
+        fi
+    elif [ -f "./scripts/${script_name}" ]; then
+        local_path="./scripts/${script_name}"
+    elif [ -f "./${script_name}" ]; then
+        local_path="./${script_name}"
+    fi
+
+    [ -n "$local_path" ] || return 1
+    printf '%s\n' "$local_path"
+}
+
+install_helper_script() {
+    local script_name="$1"
+    local dest="$2"
+    local label="$3"
+    local url="https://raw.githubusercontent.com/oneclickvirt/kubevirt/main/scripts/${script_name}"
+    local local_path=""
+
+    local_path=$(find_local_script "$script_name" 2>/dev/null || true)
+    if [ -n "${KUBEVIRT_SCRIPT_DIR:-}" ] && [ -z "$local_path" ]; then
+        _error "${label} 本地脚本不存在：${KUBEVIRT_SCRIPT_DIR}/${script_name} 或 ${KUBEVIRT_SCRIPT_DIR}/scripts/${script_name}"
+    fi
+
+    if [ -n "$local_path" ]; then
+        cp "$local_path" "$dest"
+        _info "安装本地 ${label}：${local_path} -> ${dest}"
+    else
+        download_or_error "$url" "$dest" "$label"
+    fi
+    chmod +x "$dest"
+}
+
+print_k3s_diagnostics() {
+    _warn "K3s 安装诊断信息："
+    if [ -f /tmp/k3s-install-log.txt ]; then
+        _warn "最近的 K3s 安装日志："
+        tail -40 /tmp/k3s-install-log.txt 2>/dev/null || true
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl status k3s --no-pager -l 2>/dev/null | tail -40 || true
+    fi
+    if command -v journalctl >/dev/null 2>&1; then
+        journalctl -u k3s --no-pager -n 40 2>/dev/null || true
+    fi
+}
+
+print_namespace_diagnostics() {
+    local ns="$1"
+    local label="$2"
+    _warn "${label} 诊断信息（namespace: ${ns}）："
+    kubectl get pods -n "$ns" -o wide 2>/dev/null || true
+    kubectl get events -n "$ns" --sort-by=.lastTimestamp 2>/dev/null | tail -30 || true
+}
+
 # ===== K3s 安装 =====
 install_k3s() {
     _step "安装 K3s（轻量级 Kubernetes）..."
@@ -162,25 +284,38 @@ install_k3s() {
 
     # 下载 K3s 安装脚本（优先国内镜像，失败回退官方）
     local install_script="/tmp/k3s-install.sh"
-    _info "下载 K3s 安装脚本..."
-    if ! curl -fsSL --connect-timeout 15 --max-time 60 \
+    if [ -n "${K3S_INSTALL_SCRIPT:-}" ]; then
+        if [ ! -f "$K3S_INSTALL_SCRIPT" ]; then
+            _error "本地 K3s 安装脚本不存在：${K3S_INSTALL_SCRIPT}"
+        fi
+        cp "$K3S_INSTALL_SCRIPT" "$install_script"
+        _info "使用本地 K3s 安装脚本：${K3S_INSTALL_SCRIPT}"
+    else
+        _info "下载 K3s 安装脚本..."
+        if ! curl -fsSL --connect-timeout 15 --max-time 60 \
             "https://rancher-mirror.rancher.cn/k3s/k3s-install.sh" -o "$install_script" 2>/dev/null; then
-        _warn "国内镜像下载失败，使用官方源..."
-        curl -fsSL --connect-timeout 30 --max-time 120 \
-            "https://get.k3s.io" -o "$install_script"
+            _warn "国内镜像下载失败，使用官方源..."
+            if ! curl -fsSL --connect-timeout 30 --max-time 120 \
+                "https://get.k3s.io" -o "$install_script"; then
+                _error "K3s 安装脚本下载失败，请检查网络、DNS 或代理配置；也可设置 K3S_INSTALL_SCRIPT 使用本地脚本"
+            fi
+        fi
     fi
     chmod +x "$install_script"
 
     # 禁用 traefik，减少资源占用；开放全部端口范围
     _info "执行 K3s 安装..."
-    INSTALL_K3S_VERSION="${K3S_VERSION}" \
+    if ! INSTALL_K3S_VERSION="${K3S_VERSION}" \
     sh "$install_script" \
         --disable traefik \
         --disable servicelb \
         --disable metrics-server \
         --kube-apiserver-arg="service-node-port-range=1-65535" \
         --write-kubeconfig-mode 644 \
-        2>&1 | tee /tmp/k3s-install-log.txt
+        2>&1 | tee /tmp/k3s-install-log.txt; then
+        print_k3s_diagnostics
+        _error "K3s 安装命令失败，请根据以上日志检查网络、权限、内核或 systemd 状态"
+    fi
 
     # 等待 K3s 就绪
     _info "等待 K3s 启动（最多 120 秒）..."
@@ -190,6 +325,7 @@ install_k3s() {
         sleep 3
         elapsed=$((elapsed + 3))
         if [ "$elapsed" -ge "$timeout" ]; then
+            print_k3s_diagnostics
             _error "K3s 启动超时，请检查日志：journalctl -u k3s"
         fi
         echo -n "."
@@ -198,7 +334,10 @@ install_k3s() {
 
     # 等待节点 Ready
     _info "等待节点就绪..."
-    k3s kubectl wait --for=condition=Ready nodes --all --timeout=120s
+    if ! k3s kubectl wait --for=condition=Ready nodes --all --timeout=120s; then
+        print_k3s_diagnostics
+        _error "K3s 节点未在预期时间内 Ready"
+    fi
 
     # 配置 kubectl 环境变量（幂等）
     export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
@@ -228,7 +367,7 @@ install_kubevirt() {
 
     if kubectl get namespace kubevirt >/dev/null 2>&1; then
         local kv_phase
-        kv_phase=$(kubectl get kubevirt -n kubevirt kubevirt 2>/dev/null | grep -oP 'Deployed|Deploying' | head -1 || true)
+        kv_phase=$(kubectl get kubevirt kubevirt -n kubevirt -o jsonpath='{.status.phase}' 2>/dev/null || true)
         if [ "$kv_phase" = "Deployed" ]; then
             _info "KubeVirt 已安装，跳过"
             return 0
@@ -236,23 +375,34 @@ install_kubevirt() {
     fi
 
     local KV_BASE="https://github.com/kubevirt/kubevirt/releases/download/${KUBEVIRT_VERSION}"
+    local KV_OPERATOR_LOCAL="${KUBEVIRT_OPERATOR_YAML:-${KUBEVIRT_MANIFEST_DIR:+${KUBEVIRT_MANIFEST_DIR}/kubevirt-operator.yaml}}"
+    local KV_CR_LOCAL="${KUBEVIRT_CR_YAML:-${KUBEVIRT_MANIFEST_DIR:+${KUBEVIRT_MANIFEST_DIR}/kubevirt-cr.yaml}}"
 
     # Operator
     _info "下载并部署 KubeVirt Operator..."
-    download_with_retry "${KV_BASE}/kubevirt-operator.yaml" "/tmp/kubevirt-operator.yaml"
-    kubectl apply -f /tmp/kubevirt-operator.yaml
+    use_local_or_download "${KV_BASE}/kubevirt-operator.yaml" "/tmp/kubevirt-operator.yaml" "KubeVirt Operator" "$KV_OPERATOR_LOCAL"
+    if ! kubectl apply -f /tmp/kubevirt-operator.yaml; then
+        print_namespace_diagnostics "kubevirt" "KubeVirt Operator apply 失败"
+        _error "KubeVirt Operator 部署失败"
+    fi
 
     # 等待 operator 就绪
     _info "等待 KubeVirt Operator 就绪（最多 5 分钟）..."
-    kubectl wait --for=condition=Available \
+    if ! kubectl wait --for=condition=Available \
         deployment/virt-operator \
         -n kubevirt \
-        --timeout=300s
+        --timeout=300s; then
+        print_namespace_diagnostics "kubevirt" "KubeVirt Operator 未就绪"
+        _error "KubeVirt Operator 未在 5 分钟内就绪"
+    fi
 
     # CR
     _info "下载并部署 KubeVirt CR..."
-    download_with_retry "${KV_BASE}/kubevirt-cr.yaml" "/tmp/kubevirt-cr.yaml"
-    kubectl apply -f /tmp/kubevirt-cr.yaml
+    use_local_or_download "${KV_BASE}/kubevirt-cr.yaml" "/tmp/kubevirt-cr.yaml" "KubeVirt CR" "$KV_CR_LOCAL"
+    if ! kubectl apply -f /tmp/kubevirt-cr.yaml; then
+        print_namespace_diagnostics "kubevirt" "KubeVirt CR apply 失败"
+        _error "KubeVirt CR 部署失败"
+    fi
 
     # 如果不支持 KVM，启用软件模拟
     if [ "${USE_EMULATION:-0}" = "1" ]; then
@@ -263,10 +413,13 @@ install_kubevirt() {
 
     # 等待所有 KubeVirt 组件就绪
     _info "等待 KubeVirt 部署完成（最多 10 分钟）..."
-    kubectl wait kubevirt kubevirt \
+    if ! kubectl wait kubevirt kubevirt \
         -n kubevirt \
         --for=condition=Available \
-        --timeout=600s
+        --timeout=600s; then
+        print_namespace_diagnostics "kubevirt" "KubeVirt 未就绪"
+        _error "KubeVirt 未在 10 分钟内完成部署"
+    fi
 
     _info "KubeVirt 安装完成"
     kubectl get pods -n kubevirt
@@ -278,35 +431,54 @@ install_cdi() {
     export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 
     if kubectl get namespace cdi >/dev/null 2>&1; then
-        _info "CDI 已安装，跳过"
-        return 0
+        local cdi_phase
+        cdi_phase=$(kubectl get cdi cdi -n cdi -o jsonpath='{.status.phase}' 2>/dev/null || true)
+        if [ "$cdi_phase" = "Deployed" ]; then
+            _info "CDI 已安装，跳过"
+            return 0
+        fi
+        _warn "检测到 cdi 命名空间但 CDI 未完成部署，将继续应用 manifests"
     fi
 
     local CDI_BASE="https://github.com/kubevirt/containerized-data-importer/releases/download/${CDI_VERSION}"
+    local CDI_OPERATOR_LOCAL="${CDI_OPERATOR_YAML:-${CDI_MANIFEST_DIR:+${CDI_MANIFEST_DIR}/cdi-operator.yaml}}"
+    local CDI_CR_LOCAL="${CDI_CR_YAML:-${CDI_MANIFEST_DIR:+${CDI_MANIFEST_DIR}/cdi-cr.yaml}}"
 
     # Operator
     _info "下载并部署 CDI Operator..."
-    download_with_retry "${CDI_BASE}/cdi-operator.yaml" "/tmp/cdi-operator.yaml"
-    kubectl apply -f /tmp/cdi-operator.yaml
+    use_local_or_download "${CDI_BASE}/cdi-operator.yaml" "/tmp/cdi-operator.yaml" "CDI Operator" "$CDI_OPERATOR_LOCAL"
+    if ! kubectl apply -f /tmp/cdi-operator.yaml; then
+        print_namespace_diagnostics "cdi" "CDI Operator apply 失败"
+        _error "CDI Operator 部署失败"
+    fi
 
     # 等待 operator
     _info "等待 CDI Operator 就绪（最多 5 分钟）..."
-    kubectl wait --for=condition=Available \
+    if ! kubectl wait --for=condition=Available \
         deployment/cdi-operator \
         -n cdi \
-        --timeout=300s
+        --timeout=300s; then
+        print_namespace_diagnostics "cdi" "CDI Operator 未就绪"
+        _error "CDI Operator 未在 5 分钟内就绪"
+    fi
 
     # CR
     _info "下载并部署 CDI CR..."
-    download_with_retry "${CDI_BASE}/cdi-cr.yaml" "/tmp/cdi-cr.yaml"
-    kubectl apply -f /tmp/cdi-cr.yaml
+    use_local_or_download "${CDI_BASE}/cdi-cr.yaml" "/tmp/cdi-cr.yaml" "CDI CR" "$CDI_CR_LOCAL"
+    if ! kubectl apply -f /tmp/cdi-cr.yaml; then
+        print_namespace_diagnostics "cdi" "CDI CR apply 失败"
+        _error "CDI CR 部署失败"
+    fi
 
     # 等待 CDI 就绪
     _info "等待 CDI 部署完成（最多 5 分钟）..."
-    kubectl wait cdi cdi \
+    if ! kubectl wait cdi cdi \
         -n cdi \
         --for=condition=Available \
-        --timeout=300s
+        --timeout=300s; then
+        print_namespace_diagnostics "cdi" "CDI 未就绪"
+        _error "CDI 未在 5 分钟内完成部署"
+    fi
 
     _info "CDI 安装完成"
     kubectl get pods -n cdi
@@ -323,14 +495,35 @@ install_virtctl() {
 
     local VIRTCTL_URL="https://github.com/kubevirt/kubevirt/releases/download/${VIRTCTL_VERSION}/virtctl-${VIRTCTL_VERSION}-linux-amd64"
 
-    if ! curl -fsSL --connect-timeout 30 --max-time 300 "$VIRTCTL_URL" -o /usr/local/bin/virtctl; then
+    if [ -n "${VIRTCTL_BINARY:-}" ]; then
+        if [ ! -f "$VIRTCTL_BINARY" ]; then
+            _warn "本地 virtctl 二进制不存在：${VIRTCTL_BINARY}"
+            return 1
+        fi
+        cp "$VIRTCTL_BINARY" /usr/local/bin/virtctl
+    elif ! curl -fsSL --connect-timeout 30 --max-time 300 "$VIRTCTL_URL" -o /usr/local/bin/virtctl; then
         _warn "从 GitHub 下载 virtctl 失败"
-        _warn "可以稍后手动安装：curl -L ${VIRTCTL_URL} -o /usr/local/bin/virtctl && chmod +x /usr/local/bin/virtctl"
+        _warn "可以稍后手动安装，或设置 VIRTCTL_BINARY 使用本地二进制"
         return 1
     fi
 
     chmod +x /usr/local/bin/virtctl
     _info "virtctl 安装完成：$(virtctl version --client 2>/dev/null | head -1)"
+}
+
+# ===== 安装管理脚本 =====
+install_management_scripts() {
+    _step "安装 KubeVirt 管理脚本..."
+
+    install_helper_script "onevm.sh" "/usr/local/bin/onevm.sh" "单 VM 创建脚本"
+    install_helper_script "create_vm.sh" "/usr/local/bin/create_vm.sh" "批量 VM 创建脚本"
+    install_helper_script "deletevm.sh" "/usr/local/bin/deletevm.sh" "VM 删除脚本"
+    install_helper_script "listvms.sh" "/usr/local/bin/listvms.sh" "VM 查询脚本"
+    install_helper_script "update-port-rules.sh" "/usr/local/bin/update-port-rules.sh" "端口规则更新脚本"
+    install_helper_script "snapshotvm.sh" "/usr/local/bin/snapshotvm.sh" "VM 快照脚本"
+    install_helper_script "resizevm.sh" "/usr/local/bin/resizevm.sh" "VM 资源调整脚本"
+
+    _info "管理脚本安装完成（/usr/local/bin）"
 }
 
 # ===== 创建 VM 命名空间 =====
@@ -387,9 +580,18 @@ setup_firewall_service() {
     # 安装防火墙管理库
     mkdir -p /usr/local/lib/kubevirt /etc/kubevirt
     local fw_url="https://raw.githubusercontent.com/oneclickvirt/kubevirt/main/scripts/firewall.sh"
-    if ! curl -fsSL --connect-timeout 15 --max-time 30 "$fw_url" -o /usr/local/lib/kubevirt/firewall.sh 2>/dev/null; then
+    local fw_local=""
+    fw_local=$(find_local_script "firewall.sh" 2>/dev/null || true)
+    if [ -n "${KUBEVIRT_SCRIPT_DIR:-}" ] && [ -z "$fw_local" ]; then
+        _error "防火墙库本地脚本不存在：${KUBEVIRT_SCRIPT_DIR}/firewall.sh 或 ${KUBEVIRT_SCRIPT_DIR}/scripts/firewall.sh"
+    fi
+
+    if [ -n "$fw_local" ]; then
+        cp "$fw_local" /usr/local/lib/kubevirt/firewall.sh
+        _info "安装本地防火墙库：${fw_local} -> /usr/local/lib/kubevirt/firewall.sh"
+    elif ! curl -fsSL --connect-timeout 15 --max-time 30 "$fw_url" -o /usr/local/lib/kubevirt/firewall.sh 2>/dev/null; then
         if [ ! -f /usr/local/lib/kubevirt/firewall.sh ]; then
-            _error "下载防火墙库失败，请检查网络"
+            _error "下载防火墙库失败，请检查网络；也可设置 KUBEVIRT_SCRIPT_DIR 使用本地脚本"
         fi
         _warn "下载防火墙库失败，使用已存在的版本"
     fi
@@ -397,7 +599,9 @@ setup_firewall_service() {
 
     # 检测防火墙后端
     source /usr/local/lib/kubevirt/firewall.sh
-    detect_fw_backend
+    if ! detect_fw_backend; then
+        _error "未找到可用防火墙后端，请检查 nftables/iptables 是否可用"
+    fi
     _info "防火墙后端：${FW_BACKEND}"
 
     # iptables 后端：安装 iptables-persistent 作为额外持久化
@@ -508,11 +712,15 @@ print_summary() {
     echo "  kubectl get vmi -n kubevirt-vms         # 查看运行中的 VM 实例"
     echo "  kubectl get dv -n kubevirt-vms          # 查看数据卷状态"
     echo "  virtctl console <name> -n kubevirt-vms  # 进入 VM 控制台"
+    echo "  onevm.sh vm1 2 2 20 MyPass 25000 34975 35000 debian"
+    echo "  create_vm.sh                            # 批量创建 VM"
+    echo "  listvms.sh                              # 查看 VM"
+    echo "  snapshotvm.sh vm1                       # 创建 DataVolume 克隆快照"
+    echo "  resizevm.sh vm1 4 8 40                  # 调整 CPU/内存/磁盘"
     echo ""
     echo "开始使用："
-    echo "  curl -sSL -o onevm.sh https://raw.githubusercontent.com/oneclickvirt/kubevirt/main/scripts/onevm.sh"
-    echo "  chmod +x onevm.sh"
-    echo "  ./onevm.sh vm1 2 2 20 MyPass 25000 34975 35000 debian"
+    echo "  export noninteractive=true"
+    echo "  onevm.sh vm1 2 2 20 MyPass 25000 34975 35000 debian"
     echo ""
     echo "KUBECONFIG=/etc/rancher/k3s/k3s.yaml"
     echo "======================================================"
@@ -532,11 +740,15 @@ main() {
     check_kvm
     check_resources
     install_dependencies
+    verify_dependencies
     install_k3s
     setup_kubectl
     install_kubevirt
     install_cdi
-    install_virtctl
+    if ! install_virtctl; then
+        _warn "virtctl 安装失败，环境主体已继续安装；请根据上方提示稍后手动安装"
+    fi
+    install_management_scripts
     create_vm_namespace
     configure_storage
     configure_cdi_proxy

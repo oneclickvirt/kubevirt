@@ -10,6 +10,7 @@
 #   noninteractive=true  跳过删除确认提示
 #   AUTO_YES=y           兼容旧版写法，同 noninteractive=true（FORCE_YES=y 同效）
 #   RMLOG=n              保留 vmlog 中该 VM 的记录（默认删除）
+#   DELETE_SNAPSHOTS=true  同时删除由 snapshotvm.sh 创建的 DataVolume 克隆
 #
 # 示例：
 #   noninteractive=true ./deletevm.sh vm1
@@ -81,12 +82,44 @@ show_usage() {
     exit 1
 }
 
+validate_name() {
+    if ! echo "$VM_NAME" | grep -qE '^[a-z0-9][a-z0-9-]*[a-z0-9]$|^[a-z0-9]$'; then
+        _error "VM 名称只允许小写字母、数字和连字符，且不能以连字符开头或结尾：${VM_NAME}"
+    fi
+}
+
 # ===== 检查 VM 是否存在 =====
 check_vm_exists() {
     if ! kubectl get vm "$VM_NAME" -n "$NS" >/dev/null 2>&1; then
         _error "虚拟机 '$VM_NAME' 不存在于命名空间 '$NS'"
     fi
     _info "找到虚拟机：$VM_NAME"
+}
+
+delete_resource_if_exists() {
+    local resource="$1"
+    local name="$2"
+    local label="$3"
+    local required="${4:-true}"
+
+    if ! kubectl get "$resource" "$name" -n "$NS" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if kubectl delete "$resource" "$name" -n "$NS" --timeout=60s; then
+        _info "${label} 已删除"
+        return 0
+    fi
+
+    if ! kubectl get "$resource" "$name" -n "$NS" >/dev/null 2>&1; then
+        _info "${label} 已不存在"
+        return 0
+    fi
+
+    if [ "$required" = "true" ]; then
+        _error "${label} 删除失败：${name}"
+    fi
+    _warn "${label} 删除失败，已继续后续清理：${name}"
 }
 
 # ===== 停止虚拟机 =====
@@ -129,36 +162,46 @@ delete_k8s_resources() {
     _step "删除 Kubernetes 资源..."
 
     # 删除 VirtualMachine
-    if kubectl get vm "$VM_NAME" -n "$NS" >/dev/null 2>&1; then
-        kubectl delete vm "$VM_NAME" -n "$NS" --timeout=60s
-        _info "VirtualMachine 已删除"
-    fi
+    delete_resource_if_exists "vm" "$VM_NAME" "VirtualMachine" true
 
     # 删除 DataVolume
     local DV_NAME="${VM_NAME}-dv"
-    if kubectl get datavolume "$DV_NAME" -n "$NS" >/dev/null 2>&1; then
-        kubectl delete datavolume "$DV_NAME" -n "$NS" --timeout=60s
-        _info "DataVolume ${DV_NAME} 已删除"
-    fi
+    delete_resource_if_exists "datavolume" "$DV_NAME" "DataVolume ${DV_NAME}" true
 
     # 删除 PVC（DataVolume 删除后 PVC 通常也会删除，但以防万一）
-    if kubectl get pvc "$DV_NAME" -n "$NS" >/dev/null 2>&1; then
-        kubectl delete pvc "$DV_NAME" -n "$NS" --timeout=60s 2>/dev/null || true
-        _info "PVC ${DV_NAME} 已删除"
-    fi
+    delete_resource_if_exists "pvc" "$DV_NAME" "PVC ${DV_NAME}" false
 
     # 删除 cloud-init Secret
     local SECRET_NAME="${VM_NAME}-cloudinit"
-    if kubectl get secret "$SECRET_NAME" -n "$NS" >/dev/null 2>&1; then
-        kubectl delete secret "$SECRET_NAME" -n "$NS"
-        _info "cloud-init Secret 已删除"
-    fi
+    delete_resource_if_exists "secret" "$SECRET_NAME" "cloud-init Secret" true
 
     # 删除 Service（如果有）
     local SVC_NAME="${VM_NAME}-ssh"
-    if kubectl get service "$SVC_NAME" -n "$NS" >/dev/null 2>&1; then
-        kubectl delete service "$SVC_NAME" -n "$NS"
-        _info "Service ${SVC_NAME} 已删除"
+    delete_resource_if_exists "service" "$SVC_NAME" "Service ${SVC_NAME}" true
+}
+
+# ===== 处理快照 DataVolume =====
+handle_snapshot_datavolumes() {
+    local snapshots
+    snapshots=$(kubectl get datavolume -n "$NS" \
+        -l "kubevirt.io/source-vm=${VM_NAME}" \
+        -o name 2>/dev/null || true)
+
+    [ -n "$snapshots" ] || return 0
+
+    if _is_truthy "${DELETE_SNAPSHOTS:-}"; then
+        _step "删除关联快照 DataVolume..."
+        while IFS= read -r snapshot; do
+            [ -z "$snapshot" ] && continue
+            if kubectl delete "$snapshot" -n "$NS" --timeout=60s 2>/dev/null; then
+                _info "已删除快照：${snapshot#datavolume.cdi.kubevirt.io/}"
+            else
+                _warn "快照删除失败，已保留：${snapshot#datavolume.cdi.kubevirt.io/}"
+            fi
+        done <<< "$snapshots"
+    else
+        _warn "保留以下快照 DataVolume（设置 DELETE_SNAPSHOTS=true 可随 VM 一并删除）："
+        echo "$snapshots" | sed 's#^#  - #'
     fi
 }
 
@@ -167,7 +210,9 @@ cleanup_firewall_rules() {
     _step "清理端口转发规则..."
 
     if [ -f "$FIREWALL_LIB" ]; then
-        fw_remove_vm "$VM_NAME"
+        if ! fw_remove_vm "$VM_NAME"; then
+            _error "端口转发规则清理失败，请检查防火墙状态后重试"
+        fi
     else
         _warn "防火墙库未找到，跳过规则清理"
     fi
@@ -196,6 +241,7 @@ main() {
     VM_NAME="$1"
     # 命令行第2参数优先，否则读环境变量 RMLOG，最终默认 y
     REMOVE_LOG="${2:-${RMLOG:-y}}"
+    validate_name
 
     echo "======================================================"
     echo -e "${RED}  KubeVirt 虚拟机删除脚本${NC}"
@@ -218,6 +264,7 @@ main() {
 
     stop_vm
     delete_k8s_resources
+    handle_snapshot_datavolumes
     cleanup_firewall_rules
     remove_vmlog_entry
 

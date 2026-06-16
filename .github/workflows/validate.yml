@@ -6,26 +6,37 @@ on:
   pull_request:
     branches: [ main ]
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   shellcheck:
     name: ShellCheck Lint
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Install shellcheck
         run: |
+          sudo apt-get update
           sudo apt-get install -y shellcheck
 
       - name: Run ShellCheck on all scripts
         run: |
           find . -name "*.sh" -not -path "./.git/*" | \
             xargs shellcheck \
-              --severity=warning \
+              --severity=error \
               --shell=bash \
-              --exclude=SC2034,SC1091,SC2155 \
-              || true
+              --exclude=SC2034,SC1091,SC2155
 
       - name: Validate script syntax
         run: |
@@ -35,15 +46,21 @@ jobs:
             scripts/onevm.sh \
             scripts/create_vm.sh \
             scripts/deletevm.sh \
+            scripts/firewall.sh \
             scripts/listvms.sh \
+            scripts/snapshotvm.sh \
+            scripts/resizevm.sh \
             scripts/update-port-rules.sh; do
+            [ -f "$script" ] || continue
             echo "Checking syntax: $script"
-            bash -n "$script" && echo "  OK: $script" || echo "  FAIL: $script"
+            bash -n "$script"
+            echo "  OK: $script"
           done
 
   readme-check:
     name: README Check
     runs-on: ubuntu-22.04
+    timeout-minutes: 5
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

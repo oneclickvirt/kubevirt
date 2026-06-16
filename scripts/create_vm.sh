@@ -19,6 +19,8 @@
 #   SYSTEM            操作系统               默认: ubuntu
 #   noninteractive=true  跳过所有确认提示，未提供的参数使用默认值
 #   AUTO_YES=y           兼容旧版写法，同 noninteractive=true
+#   STORE_PASSWORD_ANNOTATION=true  传递给 onevm.sh，将明文密码写入 VM 注解
+#   KEEP_FAILED_RESOURCES=true      传递给 onevm.sh，失败时保留现场资源
 #
 # 示例：
 #   VM_COUNT=3 CPU=2 MEMORY_GB=2 DISK_GB=20 PASSWORD=MyPass123 \
@@ -80,6 +82,19 @@ _is_noninteractive() {
       [ -n "${CPU+x}" ] && [ -n "${MEMORY_GB+x}" ] && \
       [ -n "${DISK_GB+x}" ] && [ -n "${PASSWORD+x}" ] && \
       [ -n "${SSH_START_PORT+x}" ] && [ -n "${SYSTEM+x}" ] )
+}
+
+_print_vmlog_summary() {
+    if [ ! -f "vmlog" ]; then
+        return 0
+    fi
+
+    if _is_truthy "${SHOW_PASSWORD:-}"; then
+        grep -E "^${VM_PREFIX}" vmlog || true
+    else
+        grep -E "^${VM_PREFIX}" vmlog | sed -E 's/(密码: )[^[:space:]]+/\1******/g' || true
+        echo "  （设置 SHOW_PASSWORD=true 显示 vmlog 中的明文密码）"
+    fi
 }
 
 _validate_uint_range() {
@@ -314,7 +329,11 @@ batch_create() {
         _step "创建虚拟机 ${vm_name} (${i+1}/${VM_COUNT})..."
         echo "======================================================"
 
-        if bash "$ONEVM_SCRIPT" \
+        if env \
+            noninteractive="${noninteractive:-true}" \
+            STORE_PASSWORD_ANNOTATION="${STORE_PASSWORD_ANNOTATION:-}" \
+            KEEP_FAILED_RESOURCES="${KEEP_FAILED_RESOURCES:-}" \
+            bash "$ONEVM_SCRIPT" \
             "$vm_name" \
             "$CPU" \
             "$MEMORY_GB" \
@@ -349,13 +368,19 @@ batch_create() {
         echo "  失败列表:${failed_list}"
     fi
     echo ""
-    echo "  所有连接信息已保存到 vmlog 文件"
+    if [ "$success" -gt 0 ]; then
+        echo "  成功创建的连接信息已保存到 vmlog 文件"
+    else
+        echo "  未成功创建虚拟机，未写入新的连接信息"
+    fi
     echo ""
     if [ -f "vmlog" ]; then
         echo "  连接摘要："
-        cat vmlog | grep -E "^${VM_PREFIX}"
+        _print_vmlog_summary
     fi
     echo "======================================================"
+
+    [ "$failed" -eq 0 ]
 }
 
 # ===== 主流程 =====

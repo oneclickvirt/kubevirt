@@ -36,6 +36,33 @@ fw_ensure_dirs() {
     [ -f "$KUBEVIRT_PORT_RULES" ] || touch "$KUBEVIRT_PORT_RULES"
 }
 
+_fw_is_port() {
+    local value="$1"
+    [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -ge 0 ] && [ "$value" -le 65535 ]
+}
+
+_fw_valid_vm_name() {
+    local vm_name="$1"
+    [[ "$vm_name" =~ ^[a-z0-9][a-z0-9-]*[a-z0-9]$|^[a-z0-9]$ ]]
+}
+
+_fw_validate_record() {
+    local vm_name="$1" vm_ip="$2" ssh_port="$3" start_port="${4:-0}" end_port="${5:-0}" vm_ip6="${6:--}"
+
+    _fw_valid_vm_name "$vm_name" || return 1
+    [ -n "$vm_ip" ] && [ "$vm_ip" != "-" ] && [[ "$vm_ip" != *[[:space:]]* ]] || return 1
+    [ -n "$vm_ip6" ] && [[ "$vm_ip6" != *[[:space:]]* ]] || return 1
+    _fw_is_port "$ssh_port" && [ "$ssh_port" -gt 0 ] || return 1
+    _fw_is_port "$start_port" || return 1
+    _fw_is_port "$end_port" || return 1
+
+    if { [ "$start_port" = "0" ] && [ "$end_port" != "0" ]; } || \
+       { [ "$start_port" != "0" ] && [ "$end_port" = "0" ]; }; then
+        return 1
+    fi
+    [ "$start_port" -le "$end_port" ] || return 1
+}
+
 # ===== nftables: 从状态文件重建全部规则 =====
 _nft_rebuild() {
     nft delete table inet kubevirt 2>/dev/null || true
@@ -57,6 +84,10 @@ _nft_rebuild() {
     while IFS=' ' read -r vm_name vm_ip ssh_port start_port end_port vm_ip6; do
         [[ "$vm_name" =~ ^# || -z "$vm_name" ]] && continue
         vm_ip6="${vm_ip6:--}"
+        if ! _fw_validate_record "$vm_name" "$vm_ip" "$ssh_port" "$start_port" "$end_port" "$vm_ip6"; then
+            echo "[WARN] 跳过无效端口规则记录：${vm_name}" >&2
+            continue
+        fi
 
         # --- IPv4 规则 ---
         nft add rule inet kubevirt prerouting tcp dport "$ssh_port" dnat ip to "${vm_ip}:22" comment \"KUBEVIRT-VM-${vm_name}-ssh\"
@@ -75,10 +106,12 @@ _nft_rebuild() {
             nft add rule inet kubevirt prerouting tcp dport "${start_port}-${end_port}" dnat ip to "$vm_ip" comment \"KUBEVIRT-VM-${vm_name}-ports-tcp\"
             nft add rule inet kubevirt prerouting udp dport "${start_port}-${end_port}" dnat ip to "$vm_ip" comment \"KUBEVIRT-VM-${vm_name}-ports-udp\"
             nft add rule inet kubevirt output tcp dport "${start_port}-${end_port}" dnat ip to "$vm_ip" comment \"KUBEVIRT-VM-${vm_name}-ports-tcp-local\"
+            nft add rule inet kubevirt output udp dport "${start_port}-${end_port}" dnat ip to "$vm_ip" comment \"KUBEVIRT-VM-${vm_name}-ports-udp-local\"
             if [ "$vm_ip6" != "-" ] && [ -n "$vm_ip6" ]; then
                 nft add rule inet kubevirt prerouting tcp dport "${start_port}-${end_port}" dnat ip6 to "$vm_ip6" comment \"KUBEVIRT-VM-${vm_name}-ports6-tcp\"
                 nft add rule inet kubevirt prerouting udp dport "${start_port}-${end_port}" dnat ip6 to "$vm_ip6" comment \"KUBEVIRT-VM-${vm_name}-ports6-udp\"
                 nft add rule inet kubevirt output tcp dport "${start_port}-${end_port}" dnat ip6 to "$vm_ip6" comment \"KUBEVIRT-VM-${vm_name}-ports6-tcp-local\"
+                nft add rule inet kubevirt output udp dport "${start_port}-${end_port}" dnat ip6 to "$vm_ip6" comment \"KUBEVIRT-VM-${vm_name}-ports6-udp-local\"
             fi
         fi
     done < "$KUBEVIRT_PORT_RULES"
@@ -111,6 +144,10 @@ _ipt_rebuild() {
     while IFS=' ' read -r vm_name vm_ip ssh_port start_port end_port vm_ip6; do
         [[ "$vm_name" =~ ^# || -z "$vm_name" ]] && continue
         vm_ip6="${vm_ip6:--}"
+        if ! _fw_validate_record "$vm_name" "$vm_ip" "$ssh_port" "$start_port" "$end_port" "$vm_ip6"; then
+            echo "[WARN] 跳过无效端口规则记录：${vm_name}" >&2
+            continue
+        fi
 
         # --- IPv4 ---
         iptables -t nat -A PREROUTING -m comment --comment "KUBEVIRT-VM-${vm_name}-ssh" -p tcp --dport "$ssh_port" -j DNAT --to-destination "${vm_ip}:22"
@@ -129,10 +166,12 @@ _ipt_rebuild() {
             iptables -t nat -A PREROUTING -m comment --comment "KUBEVIRT-VM-${vm_name}-ports-tcp" -p tcp --dport "${start_port}:${end_port}" -j DNAT --to-destination "${vm_ip}"
             iptables -t nat -A PREROUTING -m comment --comment "KUBEVIRT-VM-${vm_name}-ports-udp" -p udp --dport "${start_port}:${end_port}" -j DNAT --to-destination "${vm_ip}"
             iptables -t nat -A OUTPUT -m comment --comment "KUBEVIRT-VM-${vm_name}-ports-tcp-local" -p tcp --dport "${start_port}:${end_port}" -j DNAT --to-destination "${vm_ip}"
+            iptables -t nat -A OUTPUT -m comment --comment "KUBEVIRT-VM-${vm_name}-ports-udp-local" -p udp --dport "${start_port}:${end_port}" -j DNAT --to-destination "${vm_ip}"
             if [ "$vm_ip6" != "-" ] && [ -n "$vm_ip6" ] && command -v ip6tables >/dev/null 2>&1; then
                 ip6tables -t nat -A PREROUTING -m comment --comment "KUBEVIRT-VM-${vm_name}-ports6-tcp" -p tcp --dport "${start_port}:${end_port}" -j DNAT --to-destination "${vm_ip6}"
                 ip6tables -t nat -A PREROUTING -m comment --comment "KUBEVIRT-VM-${vm_name}-ports6-udp" -p udp --dport "${start_port}:${end_port}" -j DNAT --to-destination "${vm_ip6}"
                 ip6tables -t nat -A OUTPUT -m comment --comment "KUBEVIRT-VM-${vm_name}-ports6-tcp-local" -p tcp --dport "${start_port}:${end_port}" -j DNAT --to-destination "${vm_ip6}"
+                ip6tables -t nat -A OUTPUT -m comment --comment "KUBEVIRT-VM-${vm_name}-ports6-udp-local" -p udp --dport "${start_port}:${end_port}" -j DNAT --to-destination "${vm_ip6}"
             fi
         fi
     done < "$KUBEVIRT_PORT_RULES"
@@ -169,6 +208,11 @@ _ipt_save_persistent() {
 fw_add_vm() {
     local vm_name="$1" vm_ip="$2" ssh_port="$3" start_port="${4:-0}" end_port="${5:-0}" vm_ip6="${6:--}"
 
+    if ! _fw_validate_record "$vm_name" "$vm_ip" "$ssh_port" "$start_port" "$end_port" "$vm_ip6"; then
+        echo "[ERROR] 无效端口规则参数：${vm_name} ${vm_ip} ${ssh_port} ${start_port} ${end_port} ${vm_ip6}" >&2
+        return 1
+    fi
+
     detect_fw_backend || return 1
     fw_ensure_dirs
 
@@ -188,6 +232,11 @@ fw_add_vm() {
 fw_remove_vm() {
     local vm_name="$1"
 
+    if ! _fw_valid_vm_name "$vm_name"; then
+        echo "[ERROR] 无效 VM 名称：${vm_name}" >&2
+        return 1
+    fi
+
     detect_fw_backend || return 1
     fw_ensure_dirs
 
@@ -203,6 +252,7 @@ _fw_rebuild_locked() {
     case "$FW_BACKEND" in
         nftables) _nft_rebuild ;;
         iptables) _ipt_rebuild ;;
+        *) return 1 ;;
     esac
 }
 
