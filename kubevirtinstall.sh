@@ -131,12 +131,12 @@ install_dependencies() {
             nftables iptables ebtables ipset iproute2 \
             ca-certificates gnupg lsb-release \
             qemu-utils cloud-image-utils \
-            apache2-utils util-linux 2>/dev/null || true
+            apache2-utils util-linux sshpass 2>/dev/null || true
     elif command -v yum >/dev/null 2>&1; then
         yum install -y -q \
             curl wget git jq socat conntrack-tools \
             nftables iptables ebtables ipset iproute \
-            ca-certificates gnupg qemu-img util-linux 2>/dev/null || true
+            ca-certificates gnupg qemu-img util-linux sshpass 2>/dev/null || true
     fi
     _info "依赖安装完成"
 }
@@ -273,11 +273,36 @@ print_namespace_diagnostics() {
     kubectl get events -n "$ns" --sort-by=.lastTimestamp 2>/dev/null | tail -30 || true
 }
 
+wait_for_k3s_node_ready() {
+    local timeout="${K3S_NODE_READY_TIMEOUT:-300}"
+    local elapsed=0
+
+    _info "等待 K3s 节点注册（最多 ${timeout} 秒）..."
+    while ! k3s kubectl get nodes --no-headers 2>/dev/null | awk 'NF { found=1 } END { exit found ? 0 : 1 }'; do
+        sleep 3
+        elapsed=$((elapsed + 3))
+        if [ "$elapsed" -ge "$timeout" ]; then
+            print_k3s_diagnostics
+            _error "K3s 节点未在预期时间内注册"
+        fi
+        echo -n "."
+    done
+    echo ""
+
+    _info "等待 K3s 节点就绪（最多 ${timeout} 秒）..."
+    if ! k3s kubectl wait --for=condition=Ready nodes --all --timeout="${timeout}s"; then
+        print_k3s_diagnostics
+        _error "K3s 节点未在预期时间内 Ready"
+    fi
+}
+
 # ===== K3s 安装 =====
 install_k3s() {
     _step "安装 K3s（轻量级 Kubernetes）..."
 
     if command -v k3s >/dev/null 2>&1 && k3s kubectl get nodes >/dev/null 2>&1; then
+        _info "K3s 已安装，确认节点就绪..."
+        wait_for_k3s_node_ready
         _info "K3s 已安装且运行正常，跳过"
         return 0
     fi
@@ -332,12 +357,7 @@ install_k3s() {
     done
     echo ""
 
-    # 等待节点 Ready
-    _info "等待节点就绪..."
-    if ! k3s kubectl wait --for=condition=Ready nodes --all --timeout=120s; then
-        print_k3s_diagnostics
-        _error "K3s 节点未在预期时间内 Ready"
-    fi
+    wait_for_k3s_node_ready
 
     # 配置 kubectl 环境变量（幂等）
     export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
