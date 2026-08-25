@@ -12,8 +12,8 @@ KUBEVIRT_FW_LOCK="/var/lock/kubevirt-fw.lock"
 FW_BACKEND=""
 
 # 状态文件格式（每行）:
-#   vm_name vm_ip ssh_port start_port end_port [vm_ip6]
-# vm_ip6 为 "-" 或不存在时表示无 IPv6
+#   vm_name vm_ipv4_or_dash ssh_port start_port end_port [vm_ipv6_or_dash]
+# IPv4-only、IPv6-only 和双栈 VMI 都可记录；"-" 表示该地址族不存在。
 
 # ===== 检测防火墙后端 =====
 detect_fw_backend() {
@@ -46,12 +46,35 @@ _fw_valid_vm_name() {
     [[ "$vm_name" =~ ^[a-z0-9][a-z0-9-]*[a-z0-9]$|^[a-z0-9]$ ]]
 }
 
+_fw_is_ipv4() {
+    local address="$1" octet
+    [[ "$address" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+    local IFS=.
+    for octet in $address; do
+        (( 10#$octet <= 255 )) || return 1
+    done
+}
+
+_fw_is_ipv6() {
+    local address="$1"
+    [[ "$address" == *:* && "$address" != *[[:space:]]* ]]
+}
+
 _fw_validate_record() {
     local vm_name="$1" vm_ip="$2" ssh_port="$3" start_port="${4:-0}" end_port="${5:-0}" vm_ip6="${6:--}"
 
     _fw_valid_vm_name "$vm_name" || return 1
-    [ -n "$vm_ip" ] && [ "$vm_ip" != "-" ] && [[ "$vm_ip" != *[[:space:]]* ]] || return 1
-    [ -n "$vm_ip6" ] && [[ "$vm_ip6" != *[[:space:]]* ]] || return 1
+    if [ -n "$vm_ip" ] && [ "$vm_ip" != "-" ]; then
+        _fw_is_ipv4 "$vm_ip" || return 1
+    else
+        vm_ip="-"
+    fi
+    if [ -n "$vm_ip6" ] && [ "$vm_ip6" != "-" ]; then
+        _fw_is_ipv6 "$vm_ip6" || return 1
+    else
+        vm_ip6="-"
+    fi
+    [ "$vm_ip" != "-" ] || [ "$vm_ip6" != "-" ] || return 1
     _fw_is_port "$ssh_port" && [ "$ssh_port" -gt 0 ] || return 1
     _fw_is_port "$start_port" || return 1
     _fw_is_port "$end_port" || return 1
@@ -84,18 +107,24 @@ _nft_rebuild() {
     while IFS=' ' read -r vm_name vm_ip ssh_port start_port end_port vm_ip6; do
         [[ "$vm_name" =~ ^# || -z "$vm_name" ]] && continue
         vm_ip6="${vm_ip6:--}"
+        if _fw_is_ipv6 "$vm_ip" && { [ -z "$vm_ip6" ] || [ "$vm_ip6" = "-" ]; }; then
+            vm_ip6="$vm_ip"
+            vm_ip="-"
+        fi
         if ! _fw_validate_record "$vm_name" "$vm_ip" "$ssh_port" "$start_port" "$end_port" "$vm_ip6"; then
             echo "[WARN] 跳过无效端口规则记录：${vm_name}" >&2
             continue
         fi
 
         # --- IPv4 规则 ---
-        nft add rule inet kubevirt prerouting tcp dport "$ssh_port" dnat ip to "${vm_ip}:22" comment \"KUBEVIRT-VM-${vm_name}-ssh\"
-        nft add rule inet kubevirt output tcp dport "$ssh_port" dnat ip to "${vm_ip}:22" comment \"KUBEVIRT-VM-${vm_name}-ssh-local\"
-        nft add rule inet kubevirt postrouting ip saddr "$vm_ip" masquerade comment \"KUBEVIRT-VM-${vm_name}-masq\"
+        if _fw_is_ipv4 "$vm_ip"; then
+            nft add rule inet kubevirt prerouting tcp dport "$ssh_port" dnat ip to "${vm_ip}:22" comment \"KUBEVIRT-VM-${vm_name}-ssh\"
+            nft add rule inet kubevirt output tcp dport "$ssh_port" dnat ip to "${vm_ip}:22" comment \"KUBEVIRT-VM-${vm_name}-ssh-local\"
+            nft add rule inet kubevirt postrouting ip saddr "$vm_ip" masquerade comment \"KUBEVIRT-VM-${vm_name}-masq\"
+        fi
 
         # --- IPv6 规则（如果有 IPv6 地址）---
-        if [ "$vm_ip6" != "-" ] && [ -n "$vm_ip6" ]; then
+        if _fw_is_ipv6 "$vm_ip6"; then
             nft add rule inet kubevirt prerouting tcp dport "$ssh_port" dnat ip6 to "[${vm_ip6}]:22" comment \"KUBEVIRT-VM-${vm_name}-ssh6\"
             nft add rule inet kubevirt output tcp dport "$ssh_port" dnat ip6 to "[${vm_ip6}]:22" comment \"KUBEVIRT-VM-${vm_name}-ssh6-local\"
             nft add rule inet kubevirt postrouting ip6 saddr "$vm_ip6" masquerade comment \"KUBEVIRT-VM-${vm_name}-masq6\"
@@ -103,11 +132,13 @@ _nft_rebuild() {
 
         # --- 额外端口范围 ---
         if [ "$start_port" != "0" ] && [ "$end_port" != "0" ] && [ "$start_port" -le "$end_port" ]; then
-            nft add rule inet kubevirt prerouting tcp dport "${start_port}-${end_port}" dnat ip to "$vm_ip" comment \"KUBEVIRT-VM-${vm_name}-ports-tcp\"
-            nft add rule inet kubevirt prerouting udp dport "${start_port}-${end_port}" dnat ip to "$vm_ip" comment \"KUBEVIRT-VM-${vm_name}-ports-udp\"
-            nft add rule inet kubevirt output tcp dport "${start_port}-${end_port}" dnat ip to "$vm_ip" comment \"KUBEVIRT-VM-${vm_name}-ports-tcp-local\"
-            nft add rule inet kubevirt output udp dport "${start_port}-${end_port}" dnat ip to "$vm_ip" comment \"KUBEVIRT-VM-${vm_name}-ports-udp-local\"
-            if [ "$vm_ip6" != "-" ] && [ -n "$vm_ip6" ]; then
+            if _fw_is_ipv4 "$vm_ip"; then
+                nft add rule inet kubevirt prerouting tcp dport "${start_port}-${end_port}" dnat ip to "$vm_ip" comment \"KUBEVIRT-VM-${vm_name}-ports-tcp\"
+                nft add rule inet kubevirt prerouting udp dport "${start_port}-${end_port}" dnat ip to "$vm_ip" comment \"KUBEVIRT-VM-${vm_name}-ports-udp\"
+                nft add rule inet kubevirt output tcp dport "${start_port}-${end_port}" dnat ip to "$vm_ip" comment \"KUBEVIRT-VM-${vm_name}-ports-tcp-local\"
+                nft add rule inet kubevirt output udp dport "${start_port}-${end_port}" dnat ip to "$vm_ip" comment \"KUBEVIRT-VM-${vm_name}-ports-udp-local\"
+            fi
+            if _fw_is_ipv6 "$vm_ip6"; then
                 nft add rule inet kubevirt prerouting tcp dport "${start_port}-${end_port}" dnat ip6 to "$vm_ip6" comment \"KUBEVIRT-VM-${vm_name}-ports6-tcp\"
                 nft add rule inet kubevirt prerouting udp dport "${start_port}-${end_port}" dnat ip6 to "$vm_ip6" comment \"KUBEVIRT-VM-${vm_name}-ports6-udp\"
                 nft add rule inet kubevirt output tcp dport "${start_port}-${end_port}" dnat ip6 to "$vm_ip6" comment \"KUBEVIRT-VM-${vm_name}-ports6-tcp-local\"
@@ -144,18 +175,24 @@ _ipt_rebuild() {
     while IFS=' ' read -r vm_name vm_ip ssh_port start_port end_port vm_ip6; do
         [[ "$vm_name" =~ ^# || -z "$vm_name" ]] && continue
         vm_ip6="${vm_ip6:--}"
+        if _fw_is_ipv6 "$vm_ip" && { [ -z "$vm_ip6" ] || [ "$vm_ip6" = "-" ]; }; then
+            vm_ip6="$vm_ip"
+            vm_ip="-"
+        fi
         if ! _fw_validate_record "$vm_name" "$vm_ip" "$ssh_port" "$start_port" "$end_port" "$vm_ip6"; then
             echo "[WARN] 跳过无效端口规则记录：${vm_name}" >&2
             continue
         fi
 
         # --- IPv4 ---
-        iptables -t nat -A PREROUTING -m comment --comment "KUBEVIRT-VM-${vm_name}-ssh" -p tcp --dport "$ssh_port" -j DNAT --to-destination "${vm_ip}:22"
-        iptables -t nat -A OUTPUT -m comment --comment "KUBEVIRT-VM-${vm_name}-ssh-local" -p tcp --dport "$ssh_port" -j DNAT --to-destination "${vm_ip}:22"
-        iptables -t nat -A POSTROUTING -m comment --comment "KUBEVIRT-VM-${vm_name}-masq" -s "${vm_ip}" -j MASQUERADE
+        if _fw_is_ipv4 "$vm_ip"; then
+            iptables -t nat -A PREROUTING -m comment --comment "KUBEVIRT-VM-${vm_name}-ssh" -p tcp --dport "$ssh_port" -j DNAT --to-destination "${vm_ip}:22"
+            iptables -t nat -A OUTPUT -m comment --comment "KUBEVIRT-VM-${vm_name}-ssh-local" -p tcp --dport "$ssh_port" -j DNAT --to-destination "${vm_ip}:22"
+            iptables -t nat -A POSTROUTING -m comment --comment "KUBEVIRT-VM-${vm_name}-masq" -s "${vm_ip}" -j MASQUERADE
+        fi
 
         # --- IPv6（如果有地址且 ip6tables 可用）---
-        if [ "$vm_ip6" != "-" ] && [ -n "$vm_ip6" ] && command -v ip6tables >/dev/null 2>&1; then
+        if _fw_is_ipv6 "$vm_ip6" && command -v ip6tables >/dev/null 2>&1; then
             ip6tables -t nat -A PREROUTING -m comment --comment "KUBEVIRT-VM-${vm_name}-ssh6" -p tcp --dport "$ssh_port" -j DNAT --to-destination "[${vm_ip6}]:22"
             ip6tables -t nat -A OUTPUT -m comment --comment "KUBEVIRT-VM-${vm_name}-ssh6-local" -p tcp --dport "$ssh_port" -j DNAT --to-destination "[${vm_ip6}]:22"
             ip6tables -t nat -A POSTROUTING -m comment --comment "KUBEVIRT-VM-${vm_name}-masq6" -s "${vm_ip6}" -j MASQUERADE
@@ -163,11 +200,13 @@ _ipt_rebuild() {
 
         # --- 额外端口范围 ---
         if [ "$start_port" != "0" ] && [ "$end_port" != "0" ] && [ "$start_port" -le "$end_port" ]; then
-            iptables -t nat -A PREROUTING -m comment --comment "KUBEVIRT-VM-${vm_name}-ports-tcp" -p tcp --dport "${start_port}:${end_port}" -j DNAT --to-destination "${vm_ip}"
-            iptables -t nat -A PREROUTING -m comment --comment "KUBEVIRT-VM-${vm_name}-ports-udp" -p udp --dport "${start_port}:${end_port}" -j DNAT --to-destination "${vm_ip}"
-            iptables -t nat -A OUTPUT -m comment --comment "KUBEVIRT-VM-${vm_name}-ports-tcp-local" -p tcp --dport "${start_port}:${end_port}" -j DNAT --to-destination "${vm_ip}"
-            iptables -t nat -A OUTPUT -m comment --comment "KUBEVIRT-VM-${vm_name}-ports-udp-local" -p udp --dport "${start_port}:${end_port}" -j DNAT --to-destination "${vm_ip}"
-            if [ "$vm_ip6" != "-" ] && [ -n "$vm_ip6" ] && command -v ip6tables >/dev/null 2>&1; then
+            if _fw_is_ipv4 "$vm_ip"; then
+                iptables -t nat -A PREROUTING -m comment --comment "KUBEVIRT-VM-${vm_name}-ports-tcp" -p tcp --dport "${start_port}:${end_port}" -j DNAT --to-destination "${vm_ip}"
+                iptables -t nat -A PREROUTING -m comment --comment "KUBEVIRT-VM-${vm_name}-ports-udp" -p udp --dport "${start_port}:${end_port}" -j DNAT --to-destination "${vm_ip}"
+                iptables -t nat -A OUTPUT -m comment --comment "KUBEVIRT-VM-${vm_name}-ports-tcp-local" -p tcp --dport "${start_port}:${end_port}" -j DNAT --to-destination "${vm_ip}"
+                iptables -t nat -A OUTPUT -m comment --comment "KUBEVIRT-VM-${vm_name}-ports-udp-local" -p udp --dport "${start_port}:${end_port}" -j DNAT --to-destination "${vm_ip}"
+            fi
+            if _fw_is_ipv6 "$vm_ip6" && command -v ip6tables >/dev/null 2>&1; then
                 ip6tables -t nat -A PREROUTING -m comment --comment "KUBEVIRT-VM-${vm_name}-ports6-tcp" -p tcp --dport "${start_port}:${end_port}" -j DNAT --to-destination "${vm_ip6}"
                 ip6tables -t nat -A PREROUTING -m comment --comment "KUBEVIRT-VM-${vm_name}-ports6-udp" -p udp --dport "${start_port}:${end_port}" -j DNAT --to-destination "${vm_ip6}"
                 ip6tables -t nat -A OUTPUT -m comment --comment "KUBEVIRT-VM-${vm_name}-ports6-tcp-local" -p tcp --dport "${start_port}:${end_port}" -j DNAT --to-destination "${vm_ip6}"
@@ -207,6 +246,13 @@ _ipt_save_persistent() {
 # 用法: fw_add_vm <vm_name> <vm_ip> <ssh_port> <start_port> <end_port> [vm_ip6]
 fw_add_vm() {
     local vm_name="$1" vm_ip="$2" ssh_port="$3" start_port="${4:-0}" end_port="${5:-0}" vm_ip6="${6:--}"
+
+    # Repair records written by older scripts on IPv6-first clusters, where
+    # the primary VMI address was stored in the IPv4 field.
+    if _fw_is_ipv6 "$vm_ip" && { [ -z "$vm_ip6" ] || [ "$vm_ip6" = "-" ]; }; then
+        vm_ip6="$vm_ip"
+        vm_ip="-"
+    fi
 
     if ! _fw_validate_record "$vm_name" "$vm_ip" "$ssh_port" "$start_port" "$end_port" "$vm_ip6"; then
         echo "[ERROR] 无效端口规则参数：${vm_name} ${vm_ip} ${ssh_port} ${start_port} ${end_port} ${vm_ip6}" >&2

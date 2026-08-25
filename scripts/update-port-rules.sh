@@ -58,7 +58,10 @@ validate_vm_name() {
 apply_vm_rule_record() {
     local vm_name="$1" new_ip="$2" new_ip6="${3:--}" ssh_port="$4" start_port="${5:-0}" end_port="${6:-0}"
 
-    if [ -z "$new_ip" ] || [ "$new_ip" = "null" ]; then
+    new_ip="${new_ip:--}"
+    new_ip6="${new_ip6:--}"
+    if { [ "$new_ip" = "-" ] || [ "$new_ip" = "null" ]; } && \
+       { [ "$new_ip6" = "-" ] || [ "$new_ip6" = "null" ]; }; then
         _warn "无法获取虚拟机 $vm_name 的 IP，虚拟机可能未运行"
         return 1
     fi
@@ -68,14 +71,14 @@ apply_vm_rule_record() {
         return 1
     fi
 
-    _info "更新 $vm_name 的端口转发规则（新IP: $new_ip，后端：$(fw_backend_name)）..."
+    _info "更新 $vm_name 的端口转发规则（IPv4: $new_ip，IPv6: $new_ip6，后端：$(fw_backend_name)）..."
 
     if ! fw_add_vm "$vm_name" "$new_ip" "$ssh_port" "$start_port" "$end_port" "$new_ip6"; then
         _warn "端口转发规则更新失败：$vm_name"
         return 1
     fi
 
-    _info "规则更新成功：$vm_name → $new_ip（SSH: $ssh_port, 端口: ${start_port}-${end_port}）"
+    _info "规则更新成功：$vm_name（IPv4: $new_ip，IPv6: $new_ip6，SSH: $ssh_port, 端口: ${start_port}-${end_port}）"
 }
 
 update_vm_rules() {
@@ -90,10 +93,18 @@ update_vm_rules() {
     vmi_json=$(kubectl get vmi "$vm_name" -n "$NS" -o json 2>/dev/null || printf '{}\n')
 
     record=$(jq -n -r --argjson vm "$vm_json" --argjson vmi "$vmi_json" '
+        def interface_addresses:
+          [ .ipAddresses[]?, .ipAddress? ]
+          | map(select(type == "string" and . != "" and . != "null"))
+          | unique;
+        def first_ipv4:
+          [ interface_addresses[] | select(contains(":") | not) ][0] // "-";
+        def first_ipv6:
+          [ interface_addresses[] | select(contains(":")) ][0] // "-";
         [
           ($vm.metadata.name // ""),
-          ($vmi.status.interfaces[0].ipAddress // ""),
-          ([ $vmi.status.interfaces[0].ipAddresses[]? | select(test(":")) ][0] // "-"),
+          (($vmi.status.interfaces[0] // {}) | first_ipv4),
+          (($vmi.status.interfaces[0] // {}) | first_ipv6),
           ($vm.metadata.annotations["kubevirt.io/ssh-port"] // ""),
           ($vm.metadata.annotations["kubevirt.io/start-port"] // "0"),
           ($vm.metadata.annotations["kubevirt.io/end-port"] // "0")
@@ -118,13 +129,21 @@ update_all_vms() {
     fi
 
     records=$(printf '%s' "$vmi_json" | jq -r --argjson vms "$vm_json" '
+        def interface_addresses:
+          [ .ipAddresses[]?, .ipAddress? ]
+          | map(select(type == "string" and . != "" and . != "null"))
+          | unique;
+        def first_ipv4:
+          [ interface_addresses[] | select(contains(":") | not) ][0] // "-";
+        def first_ipv6:
+          [ interface_addresses[] | select(contains(":")) ][0] // "-";
         .items[]? as $vmi |
         ($vmi.metadata.name // "") as $name |
         ([ $vms.items[]? | select(.metadata.name == $name) ][0] // {}) as $vm |
         [
           $name,
-          ($vmi.status.interfaces[0].ipAddress // ""),
-          ([ $vmi.status.interfaces[0].ipAddresses[]? | select(test(":")) ][0] // "-"),
+          (($vmi.status.interfaces[0] // {}) | first_ipv4),
+          (($vmi.status.interfaces[0] // {}) | first_ipv6),
           ($vm.metadata.annotations["kubevirt.io/ssh-port"] // ""),
           ($vm.metadata.annotations["kubevirt.io/start-port"] // "0"),
           ($vm.metadata.annotations["kubevirt.io/end-port"] // "0")

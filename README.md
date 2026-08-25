@@ -229,11 +229,13 @@ virtctl restart <vmname> -n kubevirt-vms
 
 1. 虚拟机首次启动需要等待镜像下载导入（根据网速可能需要 5-20 分钟）
 2. 宿主机需要开启 KVM 嵌套虚拟化或直接使用裸金属服务器
-3. 端口转发通过 iptables/nftables 实现（支持IPv4 + IPv6双栈）：
+3. 端口转发通过 iptables/nftables 实现（支持 IPv4 + IPv6 双栈）：
    - 使用 systemd 服务在重启后自动恢复规则
    - Debian/Ubuntu 系统自动安装 `iptables-persistent` 和 `netfilter-persistent`
    - Red Hat/CentOS 系统自动安装 `iptables-services`
    - 规则变更后自动持久化，确保重启后不失效
+   - 脚本按 VMI 实际地址族分别建立规则，IPv6-first 或 IPv6-only 的 VMI 不会被写入 IPv4 DNAT 规则
+   - K3s 的默认安装仍是 IPv4-only；要让 VMI 获得 IPv6，须先按 K3s/CNI 文档配置集群双栈或 IPv6 网络
 4. 当前脚本仅支持 amd64/x86_64；ARM64 未提供镜像和 KubeVirt 兼容性保证
 5. CentOS 7 已 EOL，仅作为兼容镜像选项保留，生产环境建议使用 Debian/Ubuntu/Rocky/AlmaLinux
 6. 如需重置密码，通过 `virtctl console` 进入控制台手动修改

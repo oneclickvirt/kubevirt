@@ -746,6 +746,42 @@ wait_for_vmi() {
     echo ""
 }
 
+# ===== 选择虚拟机 IPv4 / IPv6 地址 =====
+# Kubernetes does not guarantee the order of ipAddresses in a dual-stack
+# cluster. Keep the address families separate so an IPv6-first VMI can never
+# be written into an IPv4 DNAT rule.
+select_vm_ip_addresses() {
+    local candidate
+    VM_IP=""
+    VM_IP6="-"
+
+    for candidate in "$@"; do
+        case "$candidate" in
+            ""|null) ;;
+            *:*)
+                if [ "$VM_IP6" = "-" ]; then
+                    VM_IP6="$candidate"
+                fi
+                ;;
+            *.*)
+                if [ -z "$VM_IP" ]; then
+                    VM_IP="$candidate"
+                fi
+                ;;
+        esac
+    done
+}
+
+log_selected_vm_ips() {
+    local source="$1"
+    if [ -n "$VM_IP" ]; then
+        _info "${source} IPv4：$VM_IP"
+    fi
+    if [ "$VM_IP6" != "-" ]; then
+        _info "${source} IPv6：$VM_IP6"
+    fi
+}
+
 # ===== 获取虚拟机 IP（IPv4 + IPv6）=====
 get_vm_ip() {
     _step "获取虚拟机内部 IP..."
@@ -755,48 +791,35 @@ get_vm_ip() {
     VM_IP6="-"
 
     while [ "$retry" -lt "$max_retry" ]; do
-        # 方法1：从 VMI 状态获取
-        VM_IP=$(kubectl get vmi "$VM_NAME" -n "$NS" \
+        # 方法1：从 VMI 状态获取。ipAddress is only the primary address, so
+        # include it as a compatibility fallback after the complete list.
+        local vmi_ips vmi_primary
+        vmi_ips=$(kubectl get vmi "$VM_NAME" -n "$NS" \
+            -o jsonpath='{.status.interfaces[0].ipAddresses[*]}' 2>/dev/null || echo "")
+        vmi_primary=$(kubectl get vmi "$VM_NAME" -n "$NS" \
             -o jsonpath='{.status.interfaces[0].ipAddress}' 2>/dev/null || echo "")
-
-        if [ -n "$VM_IP" ] && [ "$VM_IP" != "null" ]; then
-            _info "虚拟机 IPv4：$VM_IP"
-            # 尝试获取 IPv6 地址
-            local all_ips
-            all_ips=$(kubectl get vmi "$VM_NAME" -n "$NS" \
-                -o jsonpath='{.status.interfaces[0].ipAddresses[*]}' 2>/dev/null || echo "")
-            for ip in $all_ips; do
-                if echo "$ip" | grep -q ':'; then
-                    VM_IP6="$ip"
-                    _info "虚拟机 IPv6：$VM_IP6"
-                    break
-                fi
-            done
+        # shellcheck disable=SC2086 # Kubernetes jsonpath emits a space-separated address list.
+        select_vm_ip_addresses $vmi_ips "$vmi_primary"
+        if [ -n "$VM_IP" ] || [ "$VM_IP6" != "-" ]; then
+            log_selected_vm_ips "虚拟机"
             return 0
         fi
 
         # 方法2：从 virt-launcher Pod 获取
-        local pod_name
+        local pod_name pod_ips pod_primary
         pod_name=$(kubectl get pod -n "$NS" \
             -l "kubevirt.io/vm=$VM_NAME" \
             -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
 
         if [ -n "$pod_name" ] && [ "$pod_name" != "null" ]; then
-            VM_IP=$(kubectl get pod "$pod_name" -n "$NS" \
+            pod_ips=$(kubectl get pod "$pod_name" -n "$NS" \
+                -o jsonpath='{.status.podIPs[*].ip}' 2>/dev/null || echo "")
+            pod_primary=$(kubectl get pod "$pod_name" -n "$NS" \
                 -o jsonpath='{.status.podIP}' 2>/dev/null || echo "")
-            if [ -n "$VM_IP" ] && [ "$VM_IP" != "null" ]; then
-                _info "虚拟机 Pod IP：$VM_IP（通过 virt-launcher 获取）"
-                # 尝试获取 Pod IPv6
-                local pod_ips
-                pod_ips=$(kubectl get pod "$pod_name" -n "$NS" \
-                    -o jsonpath='{.status.podIPs[*].ip}' 2>/dev/null || echo "")
-                for ip in $pod_ips; do
-                    if echo "$ip" | grep -q ':'; then
-                        VM_IP6="$ip"
-                        _info "虚拟机 Pod IPv6：$VM_IP6"
-                        break
-                    fi
-                done
+            # shellcheck disable=SC2086 # Kubernetes jsonpath emits a space-separated address list.
+            select_vm_ip_addresses $pod_ips "$pod_primary"
+            if [ -n "$VM_IP" ] || [ "$VM_IP6" != "-" ]; then
+                log_selected_vm_ips "虚拟机 Pod（通过 virt-launcher 获取）"
                 return 0
             fi
         fi
@@ -809,6 +832,7 @@ get_vm_ip() {
     echo ""
     _warn "无法获取虚拟机 IP，端口转发将无法配置"
     VM_IP=""
+    VM_IP6="-"
     return 1
 }
 
@@ -816,7 +840,7 @@ get_vm_ip() {
 setup_port_forward() {
     _step "配置端口转发..."
 
-    if [ -z "$VM_IP" ]; then
+    if [ -z "$VM_IP" ] && [ "$VM_IP6" = "-" ]; then
         cleanup_failed_vm_resources
         _error "VM IP 未知，无法配置端口转发"
     fi
@@ -825,7 +849,12 @@ setup_port_forward() {
         cleanup_failed_vm_resources
         _error "未找到可用防火墙后端，无法配置端口转发"
     fi
-    _info "SSH 端口转发：宿主机:${SSH_PORT} → VM:22（后端：${FW_BACKEND}）"
+    if [ -n "$VM_IP" ]; then
+        _info "IPv4 SSH 端口转发：宿主机:${SSH_PORT} → VM:22（后端：${FW_BACKEND}）"
+    fi
+    if [ "$VM_IP6" != "-" ]; then
+        _info "IPv6 SSH 端口转发：宿主机:${SSH_PORT} → VM:22（后端：${FW_BACKEND}）"
+    fi
     if [ "$START_PORT" != "0" ] && [ "$END_PORT" != "0" ]; then
         _info "端口范围转发：宿主机:${START_PORT}-${END_PORT} → VM:${START_PORT}-${END_PORT}"
     fi

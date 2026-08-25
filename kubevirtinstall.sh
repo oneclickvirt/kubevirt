@@ -695,8 +695,22 @@ EOF
 }
 
 # ===== 配置 IP 转发 =====
+ipv6_default_route_interface() {
+    ip -6 route show default 2>/dev/null | awk '
+        /default/ {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "dev" && i < NF) {
+                    print $(i + 1)
+                    exit
+                }
+            }
+        }
+    '
+}
+
 setup_ip_forward() {
     _step "配置 IP 转发（IPv4 + IPv6）..."
+    local ipv6_uplink=""
 
     # 启用 IPv4 转发
     echo 1 > /proc/sys/net/ipv4/ip_forward
@@ -707,7 +721,19 @@ setup_ip_forward() {
 net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1
 SYSCTL
+    ipv6_uplink=$(ipv6_default_route_interface 2>/dev/null || true)
+    if [[ "$ipv6_uplink" =~ ^[[:alnum:]_.:-]+$ ]] && \
+       [[ -e "/proc/sys/net/ipv6/conf/${ipv6_uplink}/accept_ra" ]]; then
+        # Keep the physical SLAAC route alive after global forwarding is on,
+        # without enabling RA acceptance on pod and VM bridge interfaces.
+        printf 'net.ipv6.conf.%s.accept_ra = 2\n' "$ipv6_uplink" >> /etc/sysctl.d/99-kubevirt-ipforward.conf
+    else
+        ipv6_uplink=""
+    fi
     sysctl -p /etc/sysctl.d/99-kubevirt-ipforward.conf >/dev/null 2>&1 || true
+    if [[ -n "$ipv6_uplink" ]]; then
+        sysctl -w "net.ipv6.conf.${ipv6_uplink}.accept_ra=2" >/dev/null 2>&1 || true
+    fi
 
     _info "IP 转发已启用（IPv4 + IPv6）"
 }
