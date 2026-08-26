@@ -32,8 +32,8 @@ jobs:
 
       - name: Run ShellCheck on all scripts
         run: |
-          find . -name "*.sh" -not -path "./.git/*" | \
-            xargs shellcheck \
+          find . -name "*.sh" -not -path "./.git/*" -print0 | \
+            xargs -0 -r shellcheck \
               --severity=error \
               --shell=bash \
               --exclude=SC2034,SC1091,SC2155
