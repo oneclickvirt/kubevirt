@@ -100,7 +100,7 @@ kubectl() {
 update_all_vms
 assert_equals "$captured_record" 'vm6 10.42.0.42 fd42:122::42 25000 0 0' 'bulk restart rule address selection'
 
-# shellcheck disable=SC1090 # firewall.sh is a function library with no main routine.
+# shellcheck disable=SC1091,SC1090 # firewall.sh is a function library loaded from a computed path.
 source "$repo_root/scripts/firewall.sh"
 if ! _fw_validate_record vm6 - 25000 0 0 'fd42:122::42'; then
     printf 'IPv6-only firewall record was rejected\n' >&2
