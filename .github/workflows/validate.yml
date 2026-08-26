@@ -57,6 +57,12 @@ jobs:
             echo "  OK: $script"
           done
 
+      - name: Run IPv6 address regression test
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash tests/test_ipv6_address_selection.sh
+
   readme-check:
     name: README Check
     runs-on: ubuntu-22.04
