@@ -125,18 +125,20 @@ check_resources() {
 install_dependencies() {
     _step "安装基础依赖..."
     if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -y -qq
+        apt-get update -y -qq || return 1
         apt-get install -y -qq \
             curl wget git jq socat conntrack \
             nftables iptables ebtables ipset iproute2 \
             ca-certificates gnupg lsb-release \
             qemu-utils cloud-image-utils \
-            apache2-utils util-linux sshpass 2>/dev/null || true
+            apache2-utils util-linux sshpass 2>/dev/null || return 1
     elif command -v yum >/dev/null 2>&1; then
         yum install -y -q \
             curl wget git jq socat conntrack-tools \
             nftables iptables ebtables ipset iproute \
-            ca-certificates gnupg qemu-img util-linux sshpass 2>/dev/null || true
+            ca-certificates gnupg qemu-img util-linux sshpass 2>/dev/null || return 1
+    else
+        _error "未找到 apt-get 或 yum，无法安装 KubeVirt 依赖"
     fi
     _info "依赖安装完成"
 }
@@ -187,6 +189,7 @@ download_or_error() {
     local label="$3"
     if ! download_with_retry "$url" "$output"; then
         _error "${label} 下载失败：${url}"
+        return 1
     fi
 }
 
@@ -199,8 +202,9 @@ use_local_or_download() {
     if [ -n "$local_path" ]; then
         if [ ! -f "$local_path" ]; then
             _error "${label} 本地文件不存在：${local_path}"
+            return 1
         fi
-        cp "$local_path" "$output"
+        cp "$local_path" "$output" || return 1
         _info "使用本地 ${label}：${local_path}"
         return 0
     fi
@@ -240,15 +244,16 @@ install_helper_script() {
     local_path=$(find_local_script "$script_name" 2>/dev/null || true)
     if [ -n "${KUBEVIRT_SCRIPT_DIR:-}" ] && [ -z "$local_path" ]; then
         _error "${label} 本地脚本不存在：${KUBEVIRT_SCRIPT_DIR}/${script_name} 或 ${KUBEVIRT_SCRIPT_DIR}/scripts/${script_name}"
+        return 1
     fi
 
     if [ -n "$local_path" ]; then
-        cp "$local_path" "$dest"
+        cp "$local_path" "$dest" || return 1
         _info "安装本地 ${label}：${local_path} -> ${dest}"
     else
         download_or_error "$url" "$dest" "$label"
     fi
-    chmod +x "$dest"
+    chmod +x "$dest" || return 1
 }
 
 print_k3s_diagnostics() {
@@ -313,7 +318,7 @@ install_k3s() {
         if [ ! -f "$K3S_INSTALL_SCRIPT" ]; then
             _error "本地 K3s 安装脚本不存在：${K3S_INSTALL_SCRIPT}"
         fi
-        cp "$K3S_INSTALL_SCRIPT" "$install_script"
+        cp "$K3S_INSTALL_SCRIPT" "$install_script" || return 1
         _info "使用本地 K3s 安装脚本：${K3S_INSTALL_SCRIPT}"
     else
         _info "下载 K3s 安装脚本..."
@@ -326,7 +331,7 @@ install_k3s() {
             fi
         fi
     fi
-    chmod +x "$install_script"
+    chmod +x "$install_script" || return 1
 
     # 禁用 traefik，减少资源占用；开放全部端口范围
     _info "执行 K3s 安装..."
@@ -376,8 +381,10 @@ setup_kubectl() {
     export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
     # 兼容：如果没有独立的 kubectl，使用 k3s kubectl
     if ! command -v kubectl >/dev/null 2>&1; then
-        ln -sf /usr/local/bin/k3s /usr/local/bin/kubectl 2>/dev/null || true
+        ln -sf /usr/local/bin/k3s /usr/local/bin/kubectl 2>/dev/null || return 1
     fi
+    command -v kubectl >/dev/null 2>&1 || return 1
+    kubectl version --client >/dev/null 2>&1 || return 1
 }
 
 # ===== 安装 KubeVirt =====
@@ -400,7 +407,7 @@ install_kubevirt() {
 
     # Operator
     _info "下载并部署 KubeVirt Operator..."
-    use_local_or_download "${KV_BASE}/kubevirt-operator.yaml" "/tmp/kubevirt-operator.yaml" "KubeVirt Operator" "$KV_OPERATOR_LOCAL"
+    use_local_or_download "${KV_BASE}/kubevirt-operator.yaml" "/tmp/kubevirt-operator.yaml" "KubeVirt Operator" "$KV_OPERATOR_LOCAL" || return 1
     if ! kubectl apply -f /tmp/kubevirt-operator.yaml; then
         print_namespace_diagnostics "kubevirt" "KubeVirt Operator apply 失败"
         _error "KubeVirt Operator 部署失败"
@@ -418,7 +425,7 @@ install_kubevirt() {
 
     # CR
     _info "下载并部署 KubeVirt CR..."
-    use_local_or_download "${KV_BASE}/kubevirt-cr.yaml" "/tmp/kubevirt-cr.yaml" "KubeVirt CR" "$KV_CR_LOCAL"
+    use_local_or_download "${KV_BASE}/kubevirt-cr.yaml" "/tmp/kubevirt-cr.yaml" "KubeVirt CR" "$KV_CR_LOCAL" || return 1
     if ! kubectl apply -f /tmp/kubevirt-cr.yaml; then
         print_namespace_diagnostics "kubevirt" "KubeVirt CR apply 失败"
         _error "KubeVirt CR 部署失败"
@@ -428,7 +435,7 @@ install_kubevirt() {
     if [ "${USE_EMULATION:-0}" = "1" ]; then
         _warn "启用软件模拟（无 KVM）..."
         kubectl patch kubevirt kubevirt -n kubevirt --type merge \
-            -p '{"spec":{"configuration":{"developerConfiguration":{"useEmulation":true}}}}'
+            -p '{"spec":{"configuration":{"developerConfiguration":{"useEmulation":true}}}}' || return 1
     fi
 
     # 等待所有 KubeVirt 组件就绪
@@ -466,7 +473,7 @@ install_cdi() {
 
     # Operator
     _info "下载并部署 CDI Operator..."
-    use_local_or_download "${CDI_BASE}/cdi-operator.yaml" "/tmp/cdi-operator.yaml" "CDI Operator" "$CDI_OPERATOR_LOCAL"
+    use_local_or_download "${CDI_BASE}/cdi-operator.yaml" "/tmp/cdi-operator.yaml" "CDI Operator" "$CDI_OPERATOR_LOCAL" || return 1
     if ! kubectl apply -f /tmp/cdi-operator.yaml; then
         print_namespace_diagnostics "cdi" "CDI Operator apply 失败"
         _error "CDI Operator 部署失败"
@@ -484,7 +491,7 @@ install_cdi() {
 
     # CR
     _info "下载并部署 CDI CR..."
-    use_local_or_download "${CDI_BASE}/cdi-cr.yaml" "/tmp/cdi-cr.yaml" "CDI CR" "$CDI_CR_LOCAL"
+    use_local_or_download "${CDI_BASE}/cdi-cr.yaml" "/tmp/cdi-cr.yaml" "CDI CR" "$CDI_CR_LOCAL" || return 1
     if ! kubectl apply -f /tmp/cdi-cr.yaml; then
         print_namespace_diagnostics "cdi" "CDI CR apply 失败"
         _error "CDI CR 部署失败"
@@ -520,14 +527,14 @@ install_virtctl() {
             _warn "本地 virtctl 二进制不存在：${VIRTCTL_BINARY}"
             return 1
         fi
-        cp "$VIRTCTL_BINARY" /usr/local/bin/virtctl
+        cp "$VIRTCTL_BINARY" /usr/local/bin/virtctl || return 1
     elif ! curl -fsSL --connect-timeout 30 --max-time 300 "$VIRTCTL_URL" -o /usr/local/bin/virtctl; then
         _warn "从 GitHub 下载 virtctl 失败"
         _warn "可以稍后手动安装，或设置 VIRTCTL_BINARY 使用本地二进制"
         return 1
     fi
 
-    chmod +x /usr/local/bin/virtctl
+    chmod +x /usr/local/bin/virtctl || return 1
     _info "virtctl 安装完成：$(virtctl version --client 2>/dev/null | head -1)"
 }
 
@@ -535,13 +542,13 @@ install_virtctl() {
 install_management_scripts() {
     _step "安装 KubeVirt 管理脚本..."
 
-    install_helper_script "onevm.sh" "/usr/local/bin/onevm.sh" "单 VM 创建脚本"
-    install_helper_script "create_vm.sh" "/usr/local/bin/create_vm.sh" "批量 VM 创建脚本"
-    install_helper_script "deletevm.sh" "/usr/local/bin/deletevm.sh" "VM 删除脚本"
-    install_helper_script "listvms.sh" "/usr/local/bin/listvms.sh" "VM 查询脚本"
-    install_helper_script "update-port-rules.sh" "/usr/local/bin/update-port-rules.sh" "端口规则更新脚本"
-    install_helper_script "snapshotvm.sh" "/usr/local/bin/snapshotvm.sh" "VM 快照脚本"
-    install_helper_script "resizevm.sh" "/usr/local/bin/resizevm.sh" "VM 资源调整脚本"
+    install_helper_script "onevm.sh" "/usr/local/bin/onevm.sh" "单 VM 创建脚本" || return 1
+    install_helper_script "create_vm.sh" "/usr/local/bin/create_vm.sh" "批量 VM 创建脚本" || return 1
+    install_helper_script "deletevm.sh" "/usr/local/bin/deletevm.sh" "VM 删除脚本" || return 1
+    install_helper_script "listvms.sh" "/usr/local/bin/listvms.sh" "VM 查询脚本" || return 1
+    install_helper_script "update-port-rules.sh" "/usr/local/bin/update-port-rules.sh" "端口规则更新脚本" || return 1
+    install_helper_script "snapshotvm.sh" "/usr/local/bin/snapshotvm.sh" "VM 快照脚本" || return 1
+    install_helper_script "resizevm.sh" "/usr/local/bin/resizevm.sh" "VM 资源调整脚本" || return 1
 
     _info "管理脚本安装完成（/usr/local/bin）"
 }
@@ -551,12 +558,14 @@ create_vm_namespace() {
     _step "创建虚拟机命名空间..."
     export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 
-    kubectl create namespace kubevirt-vms 2>/dev/null || true
+    if ! kubectl get namespace kubevirt-vms >/dev/null 2>&1; then
+        kubectl create namespace kubevirt-vms >/dev/null || return 1
+    fi
 
     # 添加必要的标签（允许特权容器 - KubeVirt 需要）
     kubectl label namespace kubevirt-vms \
         kubevirt.io=vms \
-        --overwrite 2>/dev/null || true
+        --overwrite 2>/dev/null || return 1
 
     _info "命名空间 kubevirt-vms 已就绪"
 }
@@ -566,16 +575,24 @@ configure_storage() {
     _step "配置本地存储..."
     export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 
-    # K3s 默认带有 local-path provisioner，检查是否存在
-    if kubectl get storageclass local-path >/dev/null 2>&1; then
-        _info "存储类 local-path 已存在"
-        # 设为默认存储类
+    # Both the panel and onevm.sh explicitly request local-path for DataVolumes.
+    # Preserve other default classes, but do not accept a missing import target.
+    local classes provisioner defaults
+    classes=$(kubectl get storageclass -o json) || return 1
+    provisioner=$(jq -er '.items[] | select(.metadata.name == "local-path") | .provisioner | select(length > 0)' <<< "$classes") || {
+        _warn "缺少面板镜像导入需要的 local-path StorageClass；现有存储类保持不变"
+        return 1
+    }
+    defaults=$(jq -er '[.items[] | select(.metadata.annotations["storageclass.kubernetes.io/is-default-class"] == "true" or .metadata.annotations["storageclass.beta.kubernetes.io/is-default-class"] == "true")] | length' <<< "$classes") || return 1
+    if [ "$defaults" -eq 0 ]; then
         kubectl patch storageclass local-path \
             -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}' \
-            2>/dev/null || true
-    else
-        _warn "未找到默认存储类，CDI 可能无法正常工作"
+            || return 1
     fi
+    if [ "$provisioner" = rancher.io/local-path ]; then
+        kubectl -n kube-system rollout status deployment/local-path-provisioner --timeout=180s || return 1
+    fi
+    _info "local-path 存储类已检查，已有默认存储类保持不变"
 }
 
 # ===== 配置 CDI 上传代理 =====
@@ -584,11 +601,12 @@ configure_cdi_proxy() {
     export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 
     # 暴露 CDI 上传代理服务（NodePort）
+    kubectl get svc cdi-uploadproxy -n cdi >/dev/null 2>&1 || return 1
     kubectl patch svc cdi-uploadproxy \
         -n cdi \
         --type='json' \
         -p='[{"op":"replace","path":"/spec/type","value":"NodePort"}]' \
-        2>/dev/null || true
+        2>/dev/null || return 1
 
     _info "CDI 代理配置完成"
 }
@@ -598,7 +616,7 @@ setup_firewall_service() {
     _step "配置防火墙持久化服务..."
 
     # 安装防火墙管理库
-    mkdir -p /usr/local/lib/kubevirt /etc/kubevirt
+    mkdir -p /usr/local/lib/kubevirt /etc/kubevirt || return 1
     local fw_url="https://raw.githubusercontent.com/oneclickvirt/kubevirt/main/scripts/firewall.sh"
     local fw_local=""
     fw_local=$(find_local_script "firewall.sh" 2>/dev/null || true)
@@ -607,7 +625,7 @@ setup_firewall_service() {
     fi
 
     if [ -n "$fw_local" ]; then
-        cp "$fw_local" /usr/local/lib/kubevirt/firewall.sh
+        cp "$fw_local" /usr/local/lib/kubevirt/firewall.sh || return 1
         _info "安装本地防火墙库：${fw_local} -> /usr/local/lib/kubevirt/firewall.sh"
     elif ! curl -fsSL --connect-timeout 15 --max-time 30 "$fw_url" -o /usr/local/lib/kubevirt/firewall.sh 2>/dev/null; then
         if [ ! -f /usr/local/lib/kubevirt/firewall.sh ]; then
@@ -615,10 +633,11 @@ setup_firewall_service() {
         fi
         _warn "下载防火墙库失败，使用已存在的版本"
     fi
-    chmod +x /usr/local/lib/kubevirt/firewall.sh
+    chmod +x /usr/local/lib/kubevirt/firewall.sh || return 1
 
     # 检测防火墙后端
-    source /usr/local/lib/kubevirt/firewall.sh
+    # shellcheck disable=SC1091
+    source /usr/local/lib/kubevirt/firewall.sh || return 1
     if ! detect_fw_backend; then
         _error "未找到可用防火墙后端，请检查 nftables/iptables 是否可用"
     fi
@@ -666,8 +685,10 @@ detect_fw_backend || exit 0
 fw_clear_rules
 SCRIPT
 
-    chmod +x /usr/local/bin/kubevirt-restore-rules.sh
-    chmod +x /usr/local/bin/kubevirt-clear-rules.sh
+    [ -s /usr/local/bin/kubevirt-restore-rules.sh ] || return 1
+    [ -s /usr/local/bin/kubevirt-clear-rules.sh ] || return 1
+    chmod +x /usr/local/bin/kubevirt-restore-rules.sh || return 1
+    chmod +x /usr/local/bin/kubevirt-clear-rules.sh || return 1
 
     # systemd 服务
     cat > /etc/systemd/system/kubevirt-firewall.service <<'EOF'
@@ -688,8 +709,8 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload
-    systemctl enable kubevirt-firewall.service 2>/dev/null || true
+    systemctl daemon-reload || return 1
+    systemctl enable kubevirt-firewall.service 2>/dev/null || return 1
 
     _info "防火墙持久化服务配置完成（${FW_BACKEND}）"
 }
@@ -713,7 +734,7 @@ setup_ip_forward() {
     local ipv6_uplink=""
 
     # 启用 IPv4 转发
-    echo 1 > /proc/sys/net/ipv4/ip_forward
+    echo 1 > /proc/sys/net/ipv4/ip_forward || _error "无法启用 IPv4 转发，请检查宿主机内核权限"
     # 启用 IPv6 转发
     echo 1 > /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || true
 
@@ -721,6 +742,7 @@ setup_ip_forward() {
 net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1
 SYSCTL
+    [ -s /etc/sysctl.d/99-kubevirt-ipforward.conf ] || return 1
     ipv6_uplink=$(ipv6_default_route_interface 2>/dev/null || true)
     if [[ "$ipv6_uplink" =~ ^[[:alnum:]_.:-]+$ ]] && \
        [[ -e "/proc/sys/net/ipv6/conf/${ipv6_uplink}/accept_ra" ]]; then
@@ -730,7 +752,8 @@ SYSCTL
     else
         ipv6_uplink=""
     fi
-    sysctl -p /etc/sysctl.d/99-kubevirt-ipforward.conf >/dev/null 2>&1 || true
+    sysctl -p /etc/sysctl.d/99-kubevirt-ipforward.conf >/dev/null 2>&1 || _error "无法应用 KubeVirt 转发 sysctl 配置"
+    [ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" = "1" ] || _error "IPv4 转发未生效，容器和虚拟机网络不可用"
     if [[ -n "$ipv6_uplink" ]]; then
         sysctl -w "net.ipv6.conf.${ipv6_uplink}.accept_ra=2" >/dev/null 2>&1 || true
     fi
@@ -785,21 +808,21 @@ main() {
     check_os
     check_kvm
     check_resources
-    install_dependencies
-    verify_dependencies
-    install_k3s
-    setup_kubectl
-    install_kubevirt
-    install_cdi
+    install_dependencies || return 1
+    verify_dependencies || return 1
+    install_k3s || return 1
+    setup_kubectl || return 1
+    install_kubevirt || return 1
+    install_cdi || return 1
     if ! install_virtctl; then
         _warn "virtctl 安装失败，环境主体已继续安装；请根据上方提示稍后手动安装"
     fi
-    install_management_scripts
-    create_vm_namespace
-    configure_storage
-    configure_cdi_proxy
-    setup_ip_forward
-    setup_firewall_service
+    install_management_scripts || return 1
+    create_vm_namespace || return 1
+    configure_storage || return 1
+    configure_cdi_proxy || return 1
+    setup_ip_forward || return 1
+    setup_firewall_service || return 1
     print_summary
 }
 
