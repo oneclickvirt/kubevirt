@@ -63,6 +63,7 @@ jobs:
           set -euo pipefail
           bash tests/test_ipv6_address_selection.sh
           bash tests/initialization_test.sh
+          bash tests/image_source_test.sh
 
   readme-check:
     name: README Check

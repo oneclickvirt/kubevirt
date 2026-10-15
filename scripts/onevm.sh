@@ -314,9 +314,15 @@ _find_in_pve_kvm_images() {
     local sys="$2"
 
     _info "尝试 oneclickvirt/pve_kvm_images for ${ver}..."
+    local maintained_ver="$ver"
+    case "$ver" in
+        ubuntu[0-9][0-9]) maintained_ver="${ver}04" ;;
+        centos8-stream) maintained_ver="centos8" ;;
+        centos9-stream) maintained_ver="centos9" ;;
+    esac
     local candidate_urls=(
+        "https://github.com/oneclickvirt/pve_kvm_images/releases/download/${sys}/${maintained_ver}.qcow2"
         "https://github.com/oneclickvirt/pve_kvm_images/releases/download/images/${ver}.qcow2"
-        "https://github.com/oneclickvirt/pve_kvm_images/releases/download/${sys}/${ver}.qcow2"
     )
 
     for base_url in "${candidate_urls[@]}"; do
@@ -337,13 +343,20 @@ _find_in_pve_kvm_images() {
 }
 
 # 尝试从 oneclickvirt/kvm_images 获取镜像 URL（第二优先级）
-# release tag 与文件名均为版本标识，如 debian12/debian12.qcow2
+# release tag 为 v2.0/v1.1/v1.0，文件名仍为系统版本
 # 参数: $1=版本标识（如 debian12），结果写入 IMAGE_URL
 _find_in_kvm_images() {
     local ver="$1"
 
     _info "尝试 oneclickvirt/kvm_images for ${ver}..."
-    local base_url="https://github.com/oneclickvirt/kvm_images/releases/download/${ver}/${ver}.qcow2"
+    local release_tag
+    case "$ver" in
+        fedora34|almalinux8|debian11|debian12|ubuntu18|ubuntu20|ubuntu22|centos7|alpinelinux_edge|alpinelinux_stable|rockylinux8) release_tag="v2.0" ;;
+        debian10|debian9) release_tag="v1.1" ;;
+        archlinux|fedora33|opensuse-leap-15) release_tag="v1.0" ;;
+        *) return 1 ;;
+    esac
+    local base_url="https://github.com/oneclickvirt/kvm_images/releases/download/${release_tag}/${ver}.qcow2"
     local try_url="${CDN_PREFIX}${base_url}"
 
     if _url_accessible "$try_url"; then
