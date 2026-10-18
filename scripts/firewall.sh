@@ -394,12 +394,12 @@ fw_setup_vm_service() {
     uid=$(kubectl get vm "$VM_NAME" -n "$NS" -o jsonpath='{.metadata.uid}') || return 1
     [ -n "$uid" ] || { _error "无法取得 VM UID"; return 1; }
     manifest=$(jq -n --arg name "$VM_NAME" --arg ns "$NS" --arg uid "$uid" \
-        --argjson ssh "$SSH_PORT" --argjson start "$START_PORT" --argjson end "$END_PORT" '
+        --argjson ssh "$SSH_PORT" --argjson start "$START_PORT" --argjson last_port "$END_PORT" '
       {apiVersion:"v1",kind:"Service",metadata:{name:($name+"-ports"),namespace:$ns,
        ownerReferences:[{apiVersion:"kubevirt.io/v1",kind:"VirtualMachine",name:$name,uid:$uid}]},
        spec:{type:"NodePort",ipFamilyPolicy:"PreferDualStack",selector:{"kubevirt.io/vm":$name},
        ports:([{name:"ssh",protocol:"TCP",port:22,targetPort:22,nodePort:$ssh}] +
-         [range($start; $end+1) | select(. > 0) | . as $p | "TCP","UDP" |
+         [range($start; $last_port+1) | select(. > 0) | . as $p | "TCP","UDP" |
           {name:((ascii_downcase)+"-"+($p|tostring)),protocol:.,port:$p,targetPort:$p,nodePort:$p}])}}') || return 1
     if ! printf '%s\n' "$manifest" | kubectl apply -f -; then
         _error "NodePort Service 创建失败，请检查端口占用及 service-node-port-range"
