@@ -1,0 +1,24 @@
+name: Hosted runner guest network probe
+on:
+  workflow_dispatch:
+    inputs:
+      ports:
+        description: 'Disposable echo guest ports (comma separated, at most 12)'
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: guest-network-probe
+  cancel-in-progress: false
+jobs:
+  payload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check actual TCP and UDP payloads
+        env:
+          RUNTIME_PROBE_HOST: ${{ secrets.RUNTIME_PROBE_HOST }}
+          RUNTIME_PROBE_PORTS: ${{ inputs.ports }}
+        run: python3 tests/network_probe.py
