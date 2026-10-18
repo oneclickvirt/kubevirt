@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2317 # Fault-injection tests replace the fatal exit helper.
 # =====================================================================
 # KubeVirt 单个虚拟机开设脚本
 # 用法: ./onevm.sh <name> <cpu> <memory_gb> <disk_gb> <password> <sshport> <startport> <endport> [system]
@@ -76,6 +77,7 @@ FIREWALL_LIB="/usr/local/lib/kubevirt/firewall.sh"
 if [ ! -f "$FIREWALL_LIB" ]; then
     _error "防火墙库未找到: $FIREWALL_LIB\n请先运行安装脚本"
 fi
+# shellcheck disable=SC1090 # Runtime-installed shared firewall library.
 source "$FIREWALL_LIB"
 
 # ===== 参数解析（命令行参数优先，否则回退到同名环境变量）=====
@@ -241,15 +243,12 @@ get_host_ip() {
 
 # ===== 检测 KVM 硬件虚拟化或 QEMU TCG 模拟 =====
 _detect_emulation_mode() {
-    USE_EMULATION=0
     local kv_emulation
     kv_emulation=$(kubectl get kubevirt kubevirt -n kubevirt \
         -o jsonpath='{.spec.configuration.developerConfiguration.useEmulation}' 2>/dev/null || echo "")
     if [ "$kv_emulation" = "true" ]; then
-        USE_EMULATION=1
         _warn "KubeVirt 处于 QEMU TCG 软件模拟模式（无 KVM），性能较低"
     elif [ ! -e /dev/kvm ]; then
-        USE_EMULATION=1
         _warn "/dev/kvm 不存在，当前可能使用 QEMU TCG 模拟"
     else
         _info "KVM 硬件虚拟化可用"
@@ -464,6 +463,11 @@ get_image_url() {
     _info "镜像地址：$IMAGE_URL"
 }
 
+# Stable MAC lets both legacy ENI and modern networkd renderers identify the NIC.
+vm_primary_mac() {
+    printf '02%s\n' "$(printf '%s' "$VM_NAME" | sha256sum | cut -c1-10 | sed 's/../:&/g')"
+}
+
 # ===== 创建 cloud-init 密钥 =====
 create_cloudinit_secret() {
     _step "创建 cloud-init 配置..."
@@ -509,9 +513,28 @@ runcmd:
   - /tmp/.kubevirt-init.sh
 timezone: Asia/Shanghai"
 
+    local nodes_json network_data ipv6_config=""
+    nodes_json=$(kubectl get nodes -o json) || { _error "无法读取集群地址族"; return 1; }
+    if jq -e '[.items[].spec | (.podCIDRs // [.podCIDR])[]? | select(contains(":"))] | length > 0' \
+        <<< "$nodes_json" >/dev/null; then
+        ipv6_config="
+      - type: static6
+        address: fd10:0:2::2/120
+        gateway: fd10:0:2::1"
+    fi
+    # Network v1 avoids old cloud-init ENI incorrectly rendering ::/0 as ::/64.
+    network_data="version: 1
+config:
+  - type: physical
+    name: eth0
+    mac_address: '$(vm_primary_mac)'
+    subnets:
+      - type: dhcp4${ipv6_config}"
+
     if ! kubectl create secret generic "$SECRET_NAME" \
         -n "$NS" \
-        --from-literal=userdata="$user_data"; then
+        --from-literal=userdata="$user_data" \
+        --from-literal=networkdata="$network_data"; then
         _error "cloud-init Secret 创建失败：${SECRET_NAME}"
     fi
 
@@ -585,7 +608,7 @@ metadata:
     kubevirt.io/disk-size: "${DISK_GB}Gi"
     kubevirt.io/password-stored: "false"
 spec:
-  running: true
+  runStrategy: Always
   template:
     metadata:
       labels:
@@ -610,11 +633,13 @@ spec:
                 bus: virtio
           interfaces:
             - name: default
+              macAddress: "$(vm_primary_mac)"
               masquerade: {}
           rng: {}
       networks:
         - name: default
-          pod: {}
+          pod:
+            vmIPv6NetworkCIDR: fd10:0:2::/120
       terminationGracePeriodSeconds: 30
       volumes:
         - name: datavolumedisk
@@ -623,6 +648,8 @@ spec:
         - name: cloudinitdisk
           cloudInitNoCloud:
             secretRef:
+              name: ${SECRET_NAME}
+            networkDataSecretRef:
               name: ${SECRET_NAME}
 EOF
     then
@@ -719,7 +746,7 @@ start_vm() {
     else
         if ! kubectl patch vm "$VM_NAME" -n "$NS" \
             --type merge \
-            -p '{"spec":{"running":true}}'; then
+            -p '{"spec":{"running":null,"runStrategy":"Always"}}'; then
             cleanup_failed_vm_resources
             _error "kubectl 启动 VM 失败：${VM_NAME}"
         fi
@@ -853,31 +880,7 @@ get_vm_ip() {
 setup_port_forward() {
     _step "配置端口转发..."
 
-    if [ -z "$VM_IP" ] && [ "$VM_IP6" = "-" ]; then
-        cleanup_failed_vm_resources
-        _error "VM IP 未知，无法配置端口转发"
-    fi
-
-    if ! detect_fw_backend; then
-        cleanup_failed_vm_resources
-        _error "未找到可用防火墙后端，无法配置端口转发"
-    fi
-    if [ -n "$VM_IP" ]; then
-        _info "IPv4 SSH 端口转发：宿主机:${SSH_PORT} → VM:22（后端：${FW_BACKEND}）"
-    fi
-    if [ "$VM_IP6" != "-" ]; then
-        _info "IPv6 SSH 端口转发：宿主机:${SSH_PORT} → VM:22（后端：${FW_BACKEND}）"
-    fi
-    if [ "$START_PORT" != "0" ] && [ "$END_PORT" != "0" ]; then
-        _info "端口范围转发：宿主机:${START_PORT}-${END_PORT} → VM:${START_PORT}-${END_PORT}"
-    fi
-
-    if ! fw_add_vm "$VM_NAME" "$VM_IP" "$SSH_PORT" "$START_PORT" "$END_PORT" "$VM_IP6"; then
-        cleanup_failed_vm_resources
-        _error "端口转发规则配置失败：${VM_NAME}"
-    fi
-
-    _info "端口转发规则已配置并持久化"
+    fw_setup_vm_service "$VM_NAME" "$NS" "$SSH_PORT" "$START_PORT" "$END_PORT"
 }
 
 # ===== 保存连接信息到日志 =====
@@ -894,37 +897,61 @@ save_vmlog() {
         sed -i "/^${VM_NAME} /d" "$log_file" 2>/dev/null || true
     fi
 
+    (umask 077; touch "$log_file") || return 1
+    chmod 600 "$log_file" || return 1
     echo "$log_line" >> "$log_file"
     _info "连接信息已保存到 vmlog 文件"
 }
 
 # ===== 等待 SSH 可用 =====
 wait_for_ssh() {
-    _step "等待 SSH 服务就绪（最多 3 分钟）..."
+    local timeout="${SSH_READY_TIMEOUT:-600}"
+    if [[ ! "$timeout" =~ ^[1-9][0-9]*$ ]]; then
+        _error "SSH_READY_TIMEOUT 必须为正整数秒数"
+        # shellcheck disable=SC2317 # Tests replace the exit helper.
+        return 1
+    fi
+    _step "等待 SSH 服务就绪（最多 ${timeout} 秒）..."
     local HOST_IP
     HOST_IP=$(get_host_ip)
-    if [ "$HOST_IP" = "<宿主机IP>" ]; then
-        _warn "无法确定宿主机 IP，跳过 SSH 连通性等待"
-        return 0
+    if [ -z "$HOST_IP" ] || [ "$HOST_IP" = "<宿主机IP>" ]; then
+        _error "无法确定宿主机 IP，不能验证 SSH 登录"
+        # shellcheck disable=SC2317 # Tests replace the exit helper.
+        return 1
     fi
-
-    local timeout=180
-    local elapsed=0
-
-    while [ "$elapsed" -lt "$timeout" ]; do
-        if timeout 3 bash -c "echo >/dev/tcp/${HOST_IP}/${SSH_PORT}" 2>/dev/null; then
+    local known_hosts deadline probe remaining
+    known_hosts=$(mktemp) || return 1
+    chmod 600 "$known_hosts"
+    deadline=$((SECONDS + timeout))
+    while (( SECONDS < deadline )); do
+        remaining=$((deadline - SECONDS))
+        probe=15
+        (( remaining < probe )) && probe=$remaining
+        # shellcheck disable=SC2016 # Expand only in the authenticated guest shell.
+        if SSHPASS="$PASSWORD" timeout "$probe" sshpass -e ssh -n \
+            -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$known_hosts" \
+            -o ConnectTimeout=5 -o LogLevel=ERROR -o BatchMode=no \
+            -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+            -o NumberOfPasswordPrompts=1 -p "$SSH_PORT" "root@$HOST_IP" \
+            'test "$(id -u)" = 0 && cloud-init status --wait >/dev/null 2>&1' >/dev/null 2>&1; then
+            rm -f "$known_hosts"
             echo ""
             _info "SSH 服务已就绪"
             return 0
         fi
         echo -n "."
-        sleep 5
-        elapsed=$((elapsed + 5))
+        remaining=$((deadline - SECONDS))
+        if (( remaining > 0 )); then
+            probe=5
+            (( remaining < probe )) && probe=$remaining
+            sleep "$probe"
+        fi
     done
-
+    rm -f "$known_hosts"
     echo ""
-    _warn "SSH 端口 ${SSH_PORT} 尚未响应，虚拟机可能仍在初始化中（cloud-init 运行中）"
-    _warn "请等待 1-2 分钟后再尝试连接"
+    _error "SSH 密码登录或 cloud-init 初始化未在 ${timeout} 秒内完成；保留实例供排查"
+    # shellcheck disable=SC2317 # Tests replace the exit helper.
+    return 1
 }
 
 # ===== 输出连接信息 =====
@@ -979,9 +1006,9 @@ main() {
         cleanup_failed_vm_resources
         _error "无法获取虚拟机 IP，无法配置端口转发"
     fi
-    setup_port_forward
+    setup_port_forward || return 1
     save_vmlog
-    wait_for_ssh
+    wait_for_ssh || return 1
     print_connection_info
 }
 

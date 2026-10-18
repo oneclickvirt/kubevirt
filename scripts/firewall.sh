@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2317 # Fault-injection tests replace the fatal exit helper.
 # =====================================================================
 # KubeVirt 防火墙管理库
 # nftables 优先，iptables 回退；IPv4 + IPv6 双栈支持
@@ -118,31 +119,31 @@ _nft_rebuild() {
 
         # --- IPv4 规则 ---
         if _fw_is_ipv4 "$vm_ip"; then
-            nft add rule inet kubevirt prerouting tcp dport "$ssh_port" dnat ip to "${vm_ip}:22" comment \"KUBEVIRT-VM-${vm_name}-ssh\"
-            nft add rule inet kubevirt output tcp dport "$ssh_port" dnat ip to "${vm_ip}:22" comment \"KUBEVIRT-VM-${vm_name}-ssh-local\"
-            nft add rule inet kubevirt postrouting ip saddr "$vm_ip" masquerade comment \"KUBEVIRT-VM-${vm_name}-masq\"
+            nft add rule inet kubevirt prerouting tcp dport "$ssh_port" dnat ip to "${vm_ip}:22" comment "\"KUBEVIRT-VM-${vm_name}-ssh\""
+            nft add rule inet kubevirt output tcp dport "$ssh_port" dnat ip to "${vm_ip}:22" comment "\"KUBEVIRT-VM-${vm_name}-ssh-local\""
+            nft add rule inet kubevirt postrouting ip saddr "$vm_ip" masquerade comment "\"KUBEVIRT-VM-${vm_name}-masq\""
         fi
 
         # --- IPv6 规则（如果有 IPv6 地址）---
         if _fw_is_ipv6 "$vm_ip6"; then
-            nft add rule inet kubevirt prerouting tcp dport "$ssh_port" dnat ip6 to "[${vm_ip6}]:22" comment \"KUBEVIRT-VM-${vm_name}-ssh6\"
-            nft add rule inet kubevirt output tcp dport "$ssh_port" dnat ip6 to "[${vm_ip6}]:22" comment \"KUBEVIRT-VM-${vm_name}-ssh6-local\"
-            nft add rule inet kubevirt postrouting ip6 saddr "$vm_ip6" masquerade comment \"KUBEVIRT-VM-${vm_name}-masq6\"
+            nft add rule inet kubevirt prerouting tcp dport "$ssh_port" dnat ip6 to "[${vm_ip6}]:22" comment "\"KUBEVIRT-VM-${vm_name}-ssh6\""
+            nft add rule inet kubevirt output tcp dport "$ssh_port" dnat ip6 to "[${vm_ip6}]:22" comment "\"KUBEVIRT-VM-${vm_name}-ssh6-local\""
+            nft add rule inet kubevirt postrouting ip6 saddr "$vm_ip6" masquerade comment "\"KUBEVIRT-VM-${vm_name}-masq6\""
         fi
 
         # --- 额外端口范围 ---
         if [ "$start_port" != "0" ] && [ "$end_port" != "0" ] && [ "$start_port" -le "$end_port" ]; then
             if _fw_is_ipv4 "$vm_ip"; then
-                nft add rule inet kubevirt prerouting tcp dport "${start_port}-${end_port}" dnat ip to "$vm_ip" comment \"KUBEVIRT-VM-${vm_name}-ports-tcp\"
-                nft add rule inet kubevirt prerouting udp dport "${start_port}-${end_port}" dnat ip to "$vm_ip" comment \"KUBEVIRT-VM-${vm_name}-ports-udp\"
-                nft add rule inet kubevirt output tcp dport "${start_port}-${end_port}" dnat ip to "$vm_ip" comment \"KUBEVIRT-VM-${vm_name}-ports-tcp-local\"
-                nft add rule inet kubevirt output udp dport "${start_port}-${end_port}" dnat ip to "$vm_ip" comment \"KUBEVIRT-VM-${vm_name}-ports-udp-local\"
+                nft add rule inet kubevirt prerouting tcp dport "${start_port}-${end_port}" dnat ip to "$vm_ip" comment "\"KUBEVIRT-VM-${vm_name}-ports-tcp\""
+                nft add rule inet kubevirt prerouting udp dport "${start_port}-${end_port}" dnat ip to "$vm_ip" comment "\"KUBEVIRT-VM-${vm_name}-ports-udp\""
+                nft add rule inet kubevirt output tcp dport "${start_port}-${end_port}" dnat ip to "$vm_ip" comment "\"KUBEVIRT-VM-${vm_name}-ports-tcp-local\""
+                nft add rule inet kubevirt output udp dport "${start_port}-${end_port}" dnat ip to "$vm_ip" comment "\"KUBEVIRT-VM-${vm_name}-ports-udp-local\""
             fi
             if _fw_is_ipv6 "$vm_ip6"; then
-                nft add rule inet kubevirt prerouting tcp dport "${start_port}-${end_port}" dnat ip6 to "$vm_ip6" comment \"KUBEVIRT-VM-${vm_name}-ports6-tcp\"
-                nft add rule inet kubevirt prerouting udp dport "${start_port}-${end_port}" dnat ip6 to "$vm_ip6" comment \"KUBEVIRT-VM-${vm_name}-ports6-udp\"
-                nft add rule inet kubevirt output tcp dport "${start_port}-${end_port}" dnat ip6 to "$vm_ip6" comment \"KUBEVIRT-VM-${vm_name}-ports6-tcp-local\"
-                nft add rule inet kubevirt output udp dport "${start_port}-${end_port}" dnat ip6 to "$vm_ip6" comment \"KUBEVIRT-VM-${vm_name}-ports6-udp-local\"
+                nft add rule inet kubevirt prerouting tcp dport "${start_port}-${end_port}" dnat ip6 to "$vm_ip6" comment "\"KUBEVIRT-VM-${vm_name}-ports6-tcp\""
+                nft add rule inet kubevirt prerouting udp dport "${start_port}-${end_port}" dnat ip6 to "$vm_ip6" comment "\"KUBEVIRT-VM-${vm_name}-ports6-udp\""
+                nft add rule inet kubevirt output tcp dport "${start_port}-${end_port}" dnat ip6 to "$vm_ip6" comment "\"KUBEVIRT-VM-${vm_name}-ports6-tcp-local\""
+                nft add rule inet kubevirt output udp dport "${start_port}-${end_port}" dnat ip6 to "$vm_ip6" comment "\"KUBEVIRT-VM-${vm_name}-ports6-udp-local\""
             fi
         fi
     done < "$KUBEVIRT_PORT_RULES"
@@ -384,4 +385,30 @@ fw_backend_name() {
     else
         echo "none"
     fi
+}
+
+# NodePort endpoints follow VM Pod replacement; shared by creation and legacy repair.
+fw_setup_vm_service() {
+    local VM_NAME="$1" NS="$2" SSH_PORT="$3" START_PORT="${4:-0}" END_PORT="${5:-0}"
+    local uid manifest
+    uid=$(kubectl get vm "$VM_NAME" -n "$NS" -o jsonpath='{.metadata.uid}') || return 1
+    [ -n "$uid" ] || { _error "无法取得 VM UID"; return 1; }
+    manifest=$(jq -n --arg name "$VM_NAME" --arg ns "$NS" --arg uid "$uid" \
+        --argjson ssh "$SSH_PORT" --argjson start "$START_PORT" --argjson end "$END_PORT" '
+      {apiVersion:"v1",kind:"Service",metadata:{name:($name+"-ports"),namespace:$ns,
+       ownerReferences:[{apiVersion:"kubevirt.io/v1",kind:"VirtualMachine",name:$name,uid:$uid}]},
+       spec:{type:"NodePort",ipFamilyPolicy:"PreferDualStack",selector:{"kubevirt.io/vm":$name},
+       ports:([{name:"ssh",protocol:"TCP",port:22,targetPort:22,nodePort:$ssh}] +
+         [range($start; $end+1) | select(. > 0) | . as $p | "TCP","UDP" |
+          {name:((ascii_downcase)+"-"+($p|tostring)),protocol:.,port:$p,targetPort:$p,nodePort:$p}])}}') || return 1
+    if ! printf '%s\n' "$manifest" | kubectl apply -f -; then
+        _error "NodePort Service 创建失败，请检查端口占用及 service-node-port-range"
+        return 1
+    fi
+    # Remove only this VM's legacy DNAT: a stale Pod address would shadow Service rules.
+    if ! fw_remove_vm "$VM_NAME"; then
+        _error "旧端口规则清理失败，保留 VM 便于重试"
+        return 1
+    fi
+    _info "端口转发规则已配置并持久化（NodePort，自动跟随 VM 重建）"
 }

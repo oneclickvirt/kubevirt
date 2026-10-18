@@ -192,7 +192,7 @@ restart_vm() {
             _error "virtctl 重启失败：${VM_NAME}"
         fi
     else
-        if ! kubectl patch vm "$VM_NAME" -n "$NS" --type merge -p '{"spec":{"running":false}}'; then
+        if ! kubectl patch vm "$VM_NAME" -n "$NS" --type merge -p '{"spec":{"running":null,"runStrategy":"Halted"}}'; then
             _error "停止 VM 失败：${VM_NAME}"
         fi
         local elapsed=0
@@ -203,7 +203,7 @@ restart_vm() {
         if kubectl get vmi "$VM_NAME" -n "$NS" >/dev/null 2>&1; then
             _error "等待 VM 停止超时：${VM_NAME}"
         fi
-        if ! kubectl patch vm "$VM_NAME" -n "$NS" --type merge -p '{"spec":{"running":true}}'; then
+        if ! kubectl patch vm "$VM_NAME" -n "$NS" --type merge -p '{"spec":{"running":null,"runStrategy":"Always"}}'; then
             _error "启动 VM 失败：${VM_NAME}"
         fi
     fi

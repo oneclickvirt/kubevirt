@@ -35,7 +35,8 @@ NS="kubevirt-vms"
 # ===== 加载防火墙库 =====
 FIREWALL_LIB="/usr/local/lib/kubevirt/firewall.sh"
 if [ -f "$FIREWALL_LIB" ]; then
-    source "$FIREWALL_LIB"
+    # shellcheck disable=SC1090 # Runtime-installed shared firewall library.
+source "$FIREWALL_LIB"
 fi
 
 check_root() {
@@ -136,7 +137,7 @@ stop_vm() {
         else
             kubectl patch vm "$VM_NAME" -n "$NS" \
                 --type merge \
-                -p '{"spec":{"running":false}}' 2>/dev/null || true
+                -p '{"spec":{"running":null,"runStrategy":"Halted"}}' 2>/dev/null || true
         fi
 
         # 等待 VMI 停止

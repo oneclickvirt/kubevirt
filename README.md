@@ -30,6 +30,8 @@ export noninteractive=true
 bash <(curl -sSL https://raw.githubusercontent.com/oneclickvirt/kubevirt/main/kubevirtinstall.sh)
 ```
 
+默认版本组合为 K3s `v1.34.12+k3s1`、KubeVirt `v1.9.1`、CDI `v1.66.1`；`virtctl` 默认跟随 `KUBEVIRT_VERSION`，可用同名环境变量覆盖。集群管理员 kubeconfig 权限为 `0600`。
+
 安装完成后会把常用管理脚本安装到 `/usr/local/bin`，可直接运行 `onevm.sh`、`create_vm.sh`、`listvms.sh`、`snapshotvm.sh`、`resizevm.sh`、`deletevm.sh` 和 `update-port-rules.sh`。
 
 弱网或离线环境可提前准备安装文件后运行：
@@ -52,6 +54,8 @@ chmod +x onevm.sh
 export noninteractive=true
 ./onevm.sh <name> <cpu> <memory_gb> <disk_gb> <password> <sshport> <startport> <endport> [system]
 ```
+
+创建过程会验证真实 root 密码 SSH 和 cloud-init 完成，默认总预算 600 秒，可用 `SSH_READY_TIMEOUT` 调整。超时返回失败并保留实例供排查，不会把仅开放 TCP 端口计为创建成功。
 
 **参数说明：**
 
@@ -257,3 +261,20 @@ virtctl restart <vmname> -n kubevirt-vms
 **快照是否等同于应用一致性备份？**
 
 不是。`snapshotvm.sh` 使用 CDI DataVolume 克隆。运行中 VM 的磁盘可能存在未刷盘数据，建议先停止 VM 再创建快照。
+
+### 双栈集群与稳定端口映射
+
+安装器默认 `K3S_IP_FAMILY=auto`：检测 IPv6 默认路由及其接口的全局地址，
+具备双栈上行时创建双栈 K3s 并启用 IPv6 出网伪装。可显式设置 `ipv4` 或
+`dualstack`；显式双栈缺少上行时安装失败。可用 `K3S_CLUSTER_CIDR` 与
+`K3S_SERVICE_CIDR` 覆盖网段以避开已有网络。已有单栈集群不会自动原地转换；
+应备份工作负载后按 K3s 支持的方式重建集群。
+
+新虚拟机使用 NodePort Service 转发 SSH 及额外 TCP/UDP 端口，端点随 VM
+停止/启动后的 Pod 地址变化自动更新。创建失败会返回错误；旧版实例可在确认
+VM 名称和 vmlog 中的端口参数后运行 `update-port-rules.sh VMNAME` 迁移。
+Service 归属 VM，删除 VM 时
+自动清理。`vmlog` 保存连接信息，权限固定为 600，请勿上传到公共日志或制品。
+
+脚本双栈提供共享宿主 IPv4/IPv6 的端口转发及 IPv6 NAT 出网，不等同于为
+客体分配独立公网 IPv6；独立路由地址需要额外配置并单独验证上游路由。

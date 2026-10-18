@@ -64,6 +64,8 @@ jobs:
           bash tests/test_ipv6_address_selection.sh
           bash tests/initialization_test.sh
           bash tests/image_source_test.sh
+          bash tests/readiness_test.sh
+          bash tests/network_service_test.sh
 
   readme-check:
     name: README Check

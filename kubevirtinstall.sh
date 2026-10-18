@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2317 # Fault-injection tests replace the fatal exit helper.
 # =====================================================================
 # KubeVirt 一键安装脚本
 # 基于 K3s + KubeVirt + CDI 的虚拟机环境
@@ -8,10 +9,10 @@
 # 支持通过环境变量实现完全无交互安装：
 #
 #   noninteractive=true  统一无交互标记
-#   K3S_VERSION       K3s 版本          默认: v1.29.3+k3s1
-#   KUBEVIRT_VERSION  KubeVirt 版本     默认: v1.2.1
-#   CDI_VERSION       CDI 版本          默认: v1.59.0
-#   VIRTCTL_VERSION   virtctl 版本      默认: v1.2.1
+#   K3S_VERSION       K3s 版本          默认: v1.34.12+k3s1
+#   KUBEVIRT_VERSION  KubeVirt 版本     默认: v1.9.1
+#   CDI_VERSION       CDI 版本          默认: v1.66.1
+#   VIRTCTL_VERSION   virtctl 版本      默认: 跟随 KUBEVIRT_VERSION
 #   K3S_INSTALL_SCRIPT       本地 K3s 安装脚本路径
 #   KUBEVIRT_MANIFEST_DIR    本地 KubeVirt manifest 目录
 #   CDI_MANIFEST_DIR         本地 CDI manifest 目录
@@ -29,10 +30,10 @@ export DEBIAN_FRONTEND=noninteractive
 set -o pipefail
 
 # ===== 版本配置（支持环境变量覆盖）=====
-K3S_VERSION="${K3S_VERSION:-v1.29.3+k3s1}"
-KUBEVIRT_VERSION="${KUBEVIRT_VERSION:-v1.2.1}"
-CDI_VERSION="${CDI_VERSION:-v1.59.0}"
-VIRTCTL_VERSION="${VIRTCTL_VERSION:-v1.2.1}"
+K3S_VERSION="${K3S_VERSION:-v1.34.12+k3s1}"
+KUBEVIRT_VERSION="${KUBEVIRT_VERSION:-v1.9.1}"
+CDI_VERSION="${CDI_VERSION:-v1.66.1}"
+VIRTCTL_VERSION="${VIRTCTL_VERSION:-$KUBEVIRT_VERSION}"
 
 # ===== 颜色输出 =====
 RED='\033[0;31m'
@@ -63,9 +64,9 @@ check_arch() {
 
 check_os() {
     if [ -f /etc/os-release ]; then
+        # shellcheck disable=SC1091 # Runtime distribution metadata.
         . /etc/os-release
         OS_ID="$ID"
-        OS_VERSION="$VERSION_ID"
     else
         _error "无法检测操作系统"
     fi
@@ -189,6 +190,7 @@ download_or_error() {
     local label="$3"
     if ! download_with_retry "$url" "$output"; then
         _error "${label} 下载失败：${url}"
+        # shellcheck disable=SC2317 # Fault-injection tests replace the exit helper.
         return 1
     fi
 }
@@ -202,6 +204,7 @@ use_local_or_download() {
     if [ -n "$local_path" ]; then
         if [ ! -f "$local_path" ]; then
             _error "${label} 本地文件不存在：${local_path}"
+            # shellcheck disable=SC2317 # Fault-injection tests replace the exit helper.
             return 1
         fi
         cp "$local_path" "$output" || return 1
@@ -244,6 +247,7 @@ install_helper_script() {
     local_path=$(find_local_script "$script_name" 2>/dev/null || true)
     if [ -n "${KUBEVIRT_SCRIPT_DIR:-}" ] && [ -z "$local_path" ]; then
         _error "${label} 本地脚本不存在：${KUBEVIRT_SCRIPT_DIR}/${script_name} 或 ${KUBEVIRT_SCRIPT_DIR}/scripts/${script_name}"
+        # shellcheck disable=SC2317 # Fault-injection tests replace the exit helper.
         return 1
     fi
 
@@ -301,6 +305,35 @@ wait_for_k3s_node_ready() {
     fi
 }
 
+# Discover address families from JSON rather than version-dependent column positions.
+configure_k3s_network() {
+    K3S_NETWORK_ARGS=()
+    local mode="${K3S_IP_FAMILY:-auto}" route6 iface6 ipv6="" ipv4="" iface4
+    case "$mode" in auto|ipv4|dualstack) ;; *) _error "K3S_IP_FAMILY 必须为 auto、ipv4 或 dualstack"; return 1 ;; esac
+    [ "$mode" != ipv4 ] || return 0
+    route6=$(ip -j -6 route show default) || return 1
+    iface6=$(jq -r '[.[] | select(.dev != null)] | sort_by(.metric // 0) | .[0].dev // empty' <<< "$route6") || return 1
+    if [ -n "$iface6" ]; then
+        ipv6=$(ip -j -6 addr show dev "$iface6" scope global | jq -r \
+            '[.[].addr_info[]? | select(.scope == "global" and .tentative != true and .dadfailed != true and (.local | startswith("fe80:") | not))] | .[0].local // empty') || return 1
+    fi
+    if [ -z "$ipv6" ]; then
+        if [ "$mode" = dualstack ]; then _error "双栈需要可用的 IPv6 默认路由及全局地址"; return 1; fi
+        _info "未检测到 IPv6 上行，使用 IPv4 集群"
+        return 0
+    fi
+    iface4=$(ip -j -4 route show default | jq -r '[.[] | select(.dev != null)] | sort_by(.metric // 0) | .[0].dev // empty') || return 1
+    if [ -n "$iface4" ]; then
+        ipv4=$(ip -j -4 addr show dev "$iface4" scope global | jq -r '[.[].addr_info[]? | select(.scope == "global")][0].local // empty') || return 1
+    fi
+    [ -n "$ipv4" ] || { _error "双栈需要可用的 IPv4 上行地址"; return 1; }
+    K3S_NETWORK_ARGS=("--cluster-cidr=${K3S_CLUSTER_CIDR:-10.42.0.0/16,fd42:42::/56}"
+        "--service-cidr=${K3S_SERVICE_CIDR:-10.43.0.0/16,fd42:43::/112}"
+        "--node-ip=${ipv4},${ipv6}" --flannel-ipv6-masq
+        --kube-controller-manager-arg=node-cidr-mask-size-ipv6=64)
+    _info "检测到 IPv6 上行，创建双栈集群（IPv6 出网伪装）"
+}
+
 # ===== K3s 安装 =====
 install_k3s() {
     _step "安装 K3s（轻量级 Kubernetes）..."
@@ -311,6 +344,8 @@ install_k3s() {
         _info "K3s 已安装且运行正常，跳过"
         return 0
     fi
+
+    configure_k3s_network || return 1
 
     # 下载 K3s 安装脚本（优先国内镜像，失败回退官方）
     local install_script="/tmp/k3s-install.sh"
@@ -341,7 +376,8 @@ install_k3s() {
         --disable servicelb \
         --disable metrics-server \
         --kube-apiserver-arg="service-node-port-range=1-65535" \
-        --write-kubeconfig-mode 644 \
+        --write-kubeconfig-mode 600 \
+        "${K3S_NETWORK_ARGS[@]}" \
         2>&1 | tee /tmp/k3s-install-log.txt; then
         print_k3s_diagnostics
         _error "K3s 安装命令失败，请根据以上日志检查网络、权限、内核或 systemd 状态"

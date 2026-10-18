@@ -23,6 +23,7 @@ FIREWALL_LIB="/usr/local/lib/kubevirt/firewall.sh"
 if [ ! -f "$FIREWALL_LIB" ]; then
     _error "防火墙库未找到: $FIREWALL_LIB\n请先运行安装脚本"
 fi
+# shellcheck disable=SC1090 # Runtime-installed shared firewall library.
 source "$FIREWALL_LIB"
 
 check_root() {
@@ -58,27 +59,12 @@ validate_vm_name() {
 apply_vm_rule_record() {
     local vm_name="$1" new_ip="$2" new_ip6="${3:--}" ssh_port="$4" start_port="${5:-0}" end_port="${6:-0}"
 
-    new_ip="${new_ip:--}"
-    new_ip6="${new_ip6:--}"
-    if { [ "$new_ip" = "-" ] || [ "$new_ip" = "null" ]; } && \
-       { [ "$new_ip6" = "-" ] || [ "$new_ip6" = "null" ]; }; then
-        _warn "无法获取虚拟机 $vm_name 的 IP，虚拟机可能未运行"
+    # Migrate legacy static DNAT instead of recreating rules pointing at a Pod IP.
+    if ! fw_setup_vm_service "$vm_name" "$NS" "$ssh_port" "$start_port" "$end_port"; then
+        _warn "端口 Service 更新失败：$vm_name"
         return 1
     fi
-
-    if [ -z "$ssh_port" ]; then
-        _warn "虚拟机 $vm_name 没有 SSH 端口注解，跳过"
-        return 1
-    fi
-
-    _info "更新 $vm_name 的端口转发规则（IPv4: $new_ip，IPv6: $new_ip6，后端：$(fw_backend_name)）..."
-
-    if ! fw_add_vm "$vm_name" "$new_ip" "$ssh_port" "$start_port" "$end_port" "$new_ip6"; then
-        _warn "端口转发规则更新失败：$vm_name"
-        return 1
-    fi
-
-    _info "规则更新成功：$vm_name（IPv4: $new_ip，IPv6: $new_ip6，SSH: $ssh_port, 端口: ${start_port}-${end_port}）"
+    _info "端口 Service 已更新：$vm_name（IPv4: $new_ip，IPv6: $new_ip6）"
 }
 
 update_vm_rules() {
