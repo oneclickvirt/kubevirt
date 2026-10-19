@@ -66,6 +66,7 @@ jobs:
           bash tests/image_source_test.sh
           bash tests/readiness_test.sh
           bash tests/network_service_test.sh
+          python3 tests/multus_install_test.py
 
   readme-check:
     name: README Check

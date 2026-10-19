@@ -18,6 +18,7 @@
 #   CDI_MANIFEST_DIR         本地 CDI manifest 目录
 #   VIRTCTL_BINARY           本地 virtctl 二进制路径
 #   KUBEVIRT_SCRIPT_DIR      本地脚本目录（包含 scripts/*.sh 或 *.sh）
+#   KUBEVIRT_INSTALL_MULTUS  true 时安装 K3s/Flannel 的持久 Multus 次网卡入口
 #
 # 示例（一键无交互安装）：
 #   noninteractive=true bash kubevirtinstall.sh
@@ -258,6 +259,22 @@ install_helper_script() {
         download_or_error "$url" "$dest" "$label"
     fi
     chmod +x "$dest" || return 1
+}
+
+install_optional_multus() {
+    case "${KUBEVIRT_INSTALL_MULTUS:-false}" in
+        false|FALSE|0|'') return 0 ;;
+        true|TRUE|1) ;;
+        *) _error "KUBEVIRT_INSTALL_MULTUS 必须为 true 或 false"; return 1 ;;
+    esac
+    local manifest
+    manifest=$(find_local_script multus-k3s.json 2>/dev/null || true)
+    install_helper_script install_multus.sh /usr/local/bin/install_multus.sh 'Multus 安装器' || return 1
+    if [ -n "$manifest" ]; then
+        MULTUS_MANIFEST_FILE="$manifest" bash /usr/local/bin/install_multus.sh
+    else
+        bash /usr/local/bin/install_multus.sh
+    fi
 }
 
 print_k3s_diagnostics() {
@@ -848,6 +865,7 @@ main() {
     verify_dependencies || return 1
     install_k3s || return 1
     setup_kubectl || return 1
+    install_optional_multus || return 1
     install_kubevirt || return 1
     install_cdi || return 1
     if ! install_virtctl; then

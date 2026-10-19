@@ -279,6 +279,21 @@ Service 归属 VM，删除 VM 时
 脚本双栈提供共享宿主 IPv4/IPv6 的端口转发及 IPv6 NAT 出网，不等同于为
 客体分配独立公网 IPv6；独立路由地址需要额外配置并单独验证上游路由。
 
+### K3s/Flannel 的 Multus 次网卡
+
+需要路由 IPv6 次网卡时，可在安装时设置 `KUBEVIRT_INSTALL_MULTUS=true`，
+或在现有 K3s 主机以 root 运行 `bash scripts/install_multus.sh`。它安装固定
+摘要的 Multus v4.3.1、校验 CNI static 插件，并保留 K3s 的可执行符号链接。
+自定义数据目录可设置 `K3S_DATA_DIR`，还可分别覆盖 `K3S_CNI_BIN_DIR`、
+`K3S_CNI_CONF_DIR`。当前入口要求 K3s/Flannel 的 `10-flannel.conflist`；
+不自动转换其他主 CNI。
+
+安装器保留 `00-multus-oneclickvirt.conf`，避免 Multus 退出时删除自动配置后，
+早启动的 Pod 绕过 Multus、只拿到主网卡却显示 Ready。宿主重启时，Pod 会等待
+Multus 的 host-network DaemonSet 就绪后创建网络。该步骤只安装次网卡能力，
+路由前缀、网桥、上游 NDP 或隧道仍须按真实网络配置。旧 Pod 若已丢失次网卡，
+安装后需通过面板重启实例重建 Pod，再检查实际地址与 SSH。
+
 ### 独立外部 IPv6 密码 SSH 验证
 
 手动工作流 `Hosted runner independent IPv6 SSH` 使用 GitHub 官方 Ubuntu
