@@ -3,12 +3,20 @@ import base64
 import hashlib
 import ipaddress
 import json
+import logging
 import os
 import secrets
 import sys
 import time
 
 import paramiko
+
+logging.getLogger('paramiko').addHandler(logging.NullHandler())
+logging.getLogger('paramiko').propagate = False
+
+
+class HostKeyMismatch(paramiko.SSHException):
+    pass
 
 
 class PinnedHostKey(paramiko.MissingHostKeyPolicy):
@@ -18,7 +26,7 @@ class PinnedHostKey(paramiko.MissingHostKeyPolicy):
     def missing_host_key(self, client, hostname, key):
         actual = 'SHA256:' + base64.b64encode(hashlib.sha256(key.asbytes()).digest()).decode().rstrip('=')
         if actual != self.expected:
-            raise paramiko.SSHException('Host key does not match the supplied fingerprint')
+            raise HostKeyMismatch('Host key does not match the supplied fingerprint')
 
 
 def targets_from_environment():
@@ -68,6 +76,8 @@ def probe(row):
                 raise ValueError('Guest boot identity changed during the proof')
             return {'password_authenticated': True, 'pinned_host_key': True,
                     'root_command_nonce': True, 'transport': 'independent_ipv6'}
+        except HostKeyMismatch:
+            return {'password_authenticated': False, 'failure_type': 'HostKeyMismatch'}
         except (OSError, paramiko.SSHException) as error:
             last_type = type(error).__name__
         finally:
