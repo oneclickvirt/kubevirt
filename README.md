@@ -278,3 +278,16 @@ Service 归属 VM，删除 VM 时
 
 脚本双栈提供共享宿主 IPv4/IPv6 的端口转发及 IPv6 NAT 出网，不等同于为
 客体分配独立公网 IPv6；独立路由地址需要额外配置并单独验证上游路由。
+
+### 独立外部 IPv6 密码 SSH 验证
+
+手动工作流 `Hosted runner independent IPv6 SSH` 使用 GitHub 官方 Ubuntu
+runner，通过 Cloudflare WARP 的本地 SOCKS 代理获取独立 IPv6 出口。它校验
+客体 SSH 主机密钥指纹，禁用公钥认证，使用密码登录并执行随机值及 root 身份
+检查。HTTP 可达、SSH banner、通过宿主转发的登录均不代替此结果。
+
+仅在验收窗口设置临时 Secret `RUNTIME_IPV6_SSH_TARGETS`，内容为一到六个
+对象组成的 JSON 数组，每个对象包含 `address`、`password`、`fingerprint`
+（`SHA256:` 格式），可选 `port`、`username`、`boot_id`。只允许公网 IPv6
+目标。工作流不输出地址、口令、原始 SSH 错误或命令回传；验收完成后删除
+临时 Secret。该工作流没有定时触发器。
