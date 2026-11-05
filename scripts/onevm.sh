@@ -1,4 +1,153 @@
 #!/bin/bash
+# BEGIN shared image_mirror.sh (keep in sync with scripts/image_mirror.sh)
+#!/bin/sh
+# Shared POSIX helpers for node-first image downloads.
+# Existing callers pass their CDN and upstream URLs after the node candidate.
+
+: "${DUFS_MIRROR_BASE:=${ONECLICKVIRT_IMAGE_MIRROR_URL:-https://www.spiritlhl.com}}"
+
+image_mirror_system() {
+    _mirror_name=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr '-' '_')
+    for _mirror_os in rockylinux almalinux openwrt openeuler opensuse archlinux debian ubuntu alpine centos oracle fedora gentoo kali void freebsd devuan windows macos; do
+        case "$_mirror_name" in
+            *"$_mirror_os"*) printf '%s\n' "$_mirror_os"; return 0 ;;
+        esac
+    done
+    printf '%s\n' misc
+}
+
+image_mirror_arch() {
+    _mirror_name=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    case "$_mirror_name" in
+        *arm64*|*aarch64*) printf '%s\n' arm64 ;;
+        *armv7*|*armhf*|*arm_*) printf '%s\n' arm ;;
+        *) printf '%s\n' amd64 ;;
+    esac
+}
+
+image_mirror_path_for_release() {
+    _mirror_repo=$1
+    _mirror_tag=$2
+    _mirror_asset=$3
+    case "$_mirror_repo" in
+        template) printf 'pve/kvm/macos/amd64/%s\n' "$_mirror_asset"; return 0 ;;
+        pve_kvm_images|kvm_images) _mirror_root=pve/kvm ;;
+        pve_lxc_images|lxc_amd64_images|lxc_arm_images) _mirror_root=pve/lxc ;;
+        incus_images|lxd_images)
+            _mirror_kind=lxc
+            case "$(printf '%s %s' "$_mirror_tag" "$_mirror_asset" | tr '[:upper:]' '[:lower:]')" in *kvm*) _mirror_kind=kvm ;; esac
+            _mirror_root=${_mirror_repo%_images}/$_mirror_kind
+            ;;
+        docker|containerd|podman) _mirror_root=runtime/$_mirror_repo ;;
+        *) return 1 ;;
+    esac
+    printf '%s/%s/%s/%s\n' "$_mirror_root" "$(image_mirror_system "$_mirror_asset")" "$(image_mirror_arch "$_mirror_asset")" "$_mirror_asset"
+}
+
+image_mirror_url() {
+    [ "${ONECLICKVIRT_IMAGE_MIRROR_DISABLE:-false}" != true ] || return 0
+    printf '%s/%s\n' "${DUFS_MIRROR_BASE%/}" "${1#/}"
+}
+
+# Print node URL, then every supplied CDN/upstream URL in the original order.
+image_mirror_candidates_for_release() {
+    _mirror_path=$(image_mirror_path_for_release "$1" "$2" "$3") || return 1
+    image_mirror_url "$_mirror_path"
+    shift 3
+    for _mirror_url in "$@"; do
+        [ -n "$_mirror_url" ] && printf '%s\n' "$_mirror_url"
+    done
+}
+
+# Infer a release candidate list from an original URL.  CDN wrappers used by
+# existing scripts often contain the GitHub URL after the CDN prefix; those
+# wrappers are retained after the node candidate.
+image_mirror_candidates_for_url() {
+    _mirror_url=$1
+    case "$_mirror_url" in
+        *https://github.com/oneclickvirt/*/releases/download/*)
+            _mirror_origin=${_mirror_url#*https://github.com/oneclickvirt/}
+            _mirror_repo=${_mirror_origin%%/*}
+            _mirror_release=${_mirror_origin#*/releases/download/}
+            _mirror_tag=${_mirror_release%%/*}
+            _mirror_asset=${_mirror_release#*/}
+            _mirror_path=$(image_mirror_path_for_release "$_mirror_repo" "$_mirror_tag" "$_mirror_asset") || {
+                printf '%s\n' "$_mirror_url"
+                return 0
+            }
+            image_mirror_url "$_mirror_path"
+            printf '%s\n' "$_mirror_url"
+            _mirror_canonical="https://github.com/oneclickvirt/${_mirror_origin}"
+            [ "$_mirror_canonical" = "$_mirror_url" ] || printf '%s\n' "$_mirror_canonical"
+            ;;
+        *https://cnb.cool/oneclickvirt/template/-/git/raw/*/macos/*)
+            _mirror_asset=${_mirror_url##*/}
+            image_mirror_url "pve/kvm/macos/amd64/$_mirror_asset"
+            printf '%s\n' "$_mirror_url"
+            _mirror_canonical="https://cnb.cool/oneclickvirt/template/-/git/raw/${_mirror_url#*https://cnb.cool/oneclickvirt/template/-/git/raw/}"
+            [ "$_mirror_canonical" = "$_mirror_url" ] || printf '%s\n' "$_mirror_canonical"
+            ;;
+        *https://cnb.cool/oneclickvirt/template/-/lfs/*)
+            _mirror_canonical="https://cnb.cool/oneclickvirt/template/-/lfs/${_mirror_url#*https://cnb.cool/oneclickvirt/template/-/lfs/}"
+            image_mirror_url "__mirror/resolve?source=$_mirror_canonical"
+            printf '%s\n' "$_mirror_url"
+            [ "$_mirror_canonical" = "$_mirror_url" ] || printf '%s\n' "$_mirror_canonical"
+            ;;
+        *)
+            printf '%s\n' "$_mirror_url"
+            ;;
+    esac
+}
+
+# Download with the node first.  The output is replaced only after a complete
+# successful transfer; callers retain their historical fallback URLs.
+image_mirror_download_release() (
+    _mirror_output=$1
+    _mirror_repo=$2
+    _mirror_tag=$3
+    _mirror_asset=$4
+    shift 4
+    image_mirror_download_candidates "$_mirror_output" <<EOF_CANDIDATES
+$(image_mirror_candidates_for_release "$_mirror_repo" "$_mirror_tag" "$_mirror_asset" "$@")
+EOF_CANDIDATES
+)
+
+image_mirror_download_url() (
+    image_mirror_download_candidates "$1" <<EOF_CANDIDATES
+$(image_mirror_candidates_for_url "$2")
+EOF_CANDIDATES
+)
+
+# A subshell owns its temporary-file trap, leaving the caller's traps intact.
+image_mirror_download_candidates() (
+    _mirror_output=$1
+    _mirror_tmp=$(mktemp "${_mirror_output}.dufs.XXXXXX") || return 1
+    trap 'rm -f -- "$_mirror_tmp"' 0
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    _mirror_seen='|'
+    while IFS= read -r _mirror_candidate; do
+        [ -n "$_mirror_candidate" ] || continue
+        case "$_mirror_seen" in *"|$_mirror_candidate|"*) continue ;; esac
+        _mirror_seen="$_mirror_seen$_mirror_candidate|"
+        printf '[image-mirror] trying %s\n' "$_mirror_candidate" >&2
+        # A failed primary must yield promptly to the historical sources.
+        case "$_mirror_candidate" in
+            "${DUFS_MIRROR_BASE%/}/"*)
+                set -- --retry 0 --connect-timeout "${DUFS_MIRROR_CONNECT_TIMEOUT:-5}" \
+                    --speed-time "${DUFS_MIRROR_IDLE_TIMEOUT:-30}" --speed-limit 1024 ;;
+            *) set -- --retry 3 --retry-all-errors --connect-timeout 20 ;;
+        esac
+        if curl -fL "$@" --max-time "${DUFS_DOWNLOAD_MAX_TIME:-86400}" -o "$_mirror_tmp" "$_mirror_candidate" && [ -s "$_mirror_tmp" ]; then
+            mv -f "$_mirror_tmp" "$_mirror_output"
+            return 0
+        fi
+        rm -f "$_mirror_tmp"
+    done
+    printf '[image-mirror] all candidates failed for %s\n' "$_mirror_output" >&2
+    return 1
+)
+# END shared image_mirror.sh
 # shellcheck disable=SC2317 # Fault-injection tests replace the fatal exit helper.
 # =====================================================================
 # KubeVirt 单个虚拟机开设脚本
@@ -326,17 +475,19 @@ _find_in_pve_kvm_images() {
 
     for base_url in "${candidate_urls[@]}"; do
         _info "  尝试: ${base_url}"
-        local try_url="${CDN_PREFIX}${base_url}"
-        if _url_accessible "$try_url"; then
-            IMAGE_URL="$try_url"
-            _info "pve_kvm_images 中找到镜像 (CDN)：${base_url##*/}"
-            return 0
-        fi
-        if _url_accessible "$base_url"; then
-            IMAGE_URL="$base_url"
-            _info "pve_kvm_images 中找到镜像 (直连)：${base_url##*/}"
-            return 0
-        fi
+        local release_tag release_asset mirror_url try_url
+        release_tag="${base_url#*/releases/download/}"
+        release_tag="${release_tag%%/*}"
+        release_asset="${base_url##*/}"
+        mirror_url=$(image_mirror_url "$(image_mirror_path_for_release pve_kvm_images "$release_tag" "$release_asset")")
+        for try_url in "$mirror_url" "${CDN_PREFIX}${base_url}" "$base_url"; do
+            [ -n "$try_url" ] || continue
+            if _url_accessible "$try_url"; then
+                IMAGE_URL="$try_url"
+                _info "pve_kvm_images 中找到镜像：${try_url}"
+                return 0
+            fi
+        done
     done
     return 1
 }
@@ -356,18 +507,16 @@ _find_in_kvm_images() {
         *) return 1 ;;
     esac
     local base_url="https://github.com/oneclickvirt/kvm_images/releases/download/${release_tag}/${ver}.qcow2"
-    local try_url="${CDN_PREFIX}${base_url}"
-
-    if _url_accessible "$try_url"; then
-        IMAGE_URL="$try_url"
-        _info "kvm_images 中找到镜像 (CDN)：${ver}.qcow2"
-        return 0
-    fi
-    if _url_accessible "$base_url"; then
-        IMAGE_URL="$base_url"
-        _info "kvm_images 中找到镜像 (直连)：${ver}.qcow2"
-        return 0
-    fi
+    local mirror_url try_url
+    mirror_url=$(image_mirror_url "$(image_mirror_path_for_release kvm_images "$release_tag" "${ver}.qcow2")")
+    for try_url in "$mirror_url" "${CDN_PREFIX}${base_url}" "$base_url"; do
+        [ -n "$try_url" ] || continue
+        if _url_accessible "$try_url"; then
+            IMAGE_URL="$try_url"
+            _info "kvm_images 中找到镜像：${try_url}"
+            return 0
+        fi
+    done
     return 1
 }
 
@@ -442,25 +591,52 @@ get_image_url() {
     # 获取组织镜像版本标识
     org_ver=$(get_org_image_ver "$SYSTEM")
 
-    # 第1优先：pve_kvm_images（直接按已知 URL 模式，不调用 GitHub API）
-    if [ -n "$org_ver" ] && _find_in_pve_kvm_images "$org_ver" "$IMAGE_OS"; then
-        _info "使用来源：oneclickvirt/pve_kvm_images"
-        _info "镜像地址：$IMAGE_URL"
-        return 0
+    IMAGE_URL_CANDIDATES=()
+    local candidate seen maintained_ver release_tag base_url
+    maintained_ver="$org_ver"
+    case "$org_ver" in
+        ubuntu[0-9][0-9]) maintained_ver="${org_ver}04" ;;
+        centos8-stream) maintained_ver=centos8 ;;
+        centos9-stream) maintained_ver=centos9 ;;
+    esac
+    local sources=()
+    if [ -n "$org_ver" ]; then
+        sources+=("https://github.com/oneclickvirt/pve_kvm_images/releases/download/${IMAGE_OS}/${maintained_ver}.qcow2")
+        sources+=("https://github.com/oneclickvirt/pve_kvm_images/releases/download/images/${org_ver}.qcow2")
+        release_tag=""
+        case "$org_ver" in
+            fedora34|almalinux8|debian11|debian12|ubuntu18|ubuntu20|ubuntu22|centos7|alpinelinux_edge|alpinelinux_stable|rockylinux8) release_tag=v2.0 ;;
+            debian10|debian9) release_tag=v1.1 ;;
+            archlinux|fedora33|opensuse-leap-15) release_tag=v1.0 ;;
+        esac
+        [ -z "$release_tag" ] || sources+=("https://github.com/oneclickvirt/kvm_images/releases/download/${release_tag}/${org_ver}.qcow2")
     fi
-
-    # 第2优先：kvm_images（release tag 与文件名均为版本标识）
-    if [ -n "$org_ver" ] && _find_in_kvm_images "$org_ver"; then
-        _info "使用来源：oneclickvirt/kvm_images"
-        _info "镜像地址：$IMAGE_URL"
-        return 0
-    fi
-
-    # 最终回退：官方上游地址（兜底）
-    _warn "oneclickvirt 镜像源均不可用，回退到官方上游地址"
+    sources+=("$official_url")
+    for base_url in "${sources[@]}"; do
+        while IFS= read -r candidate; do
+            [ -n "$candidate" ] || continue
+            seen=false
+            for existing in "${IMAGE_URL_CANDIDATES[@]}"; do
+                [ "$existing" != "$candidate" ] || seen=true
+            done
+            [ "$seen" = true ] || IMAGE_URL_CANDIDATES+=("$candidate")
+        done < <(
+            image_mirror_candidates_for_url "${CDN_PREFIX}${base_url}"
+            if [ -n "$CDN_PREFIX" ]; then printf '%s\n' "$base_url"; fi
+        )
+    done
+    IMAGE_CANDIDATE_INDEX=0
+    for candidate in "${IMAGE_URL_CANDIDATES[@]}"; do
+        if _url_accessible "$candidate"; then
+            IMAGE_URL="$candidate"
+            _info "镜像地址：$IMAGE_URL"
+            return 0
+        fi
+        IMAGE_CANDIDATE_INDEX=$((IMAGE_CANDIDATE_INDEX + 1))
+    done
     IMAGE_URL="$official_url"
-    _info "使用来源：官方上游"
-    _info "镜像地址：$IMAGE_URL"
+    IMAGE_CANDIDATE_INDEX=$((${#IMAGE_URL_CANDIDATES[@]} - 1))
+    _warn "地址预检均失败，尝试官方上游：$IMAGE_URL"
 }
 
 # Stable MAC lets both legacy ENI and modern networkd renderers identify the NIC.
@@ -685,6 +861,18 @@ cleanup_failed_vm_resources() {
     fi
 }
 
+# Retry only the unfinished import volume; keep the VM configuration and secret.
+next_image_import_source() {
+    local next=$((${IMAGE_CANDIDATE_INDEX:-0} + 1))
+    [ "$next" -lt "${#IMAGE_URL_CANDIDATES[@]}" ] || return 1
+    kubectl delete datavolume "${VM_NAME}-dv" -n "$NS" --wait=true --timeout=120s || return 1
+    kubectl delete pvc "${VM_NAME}-dv" -n "$NS" --ignore-not-found --wait=true --timeout=120s || return 1
+    IMAGE_CANDIDATE_INDEX=$next
+    IMAGE_URL="${IMAGE_URL_CANDIDATES[$next]}"
+    _warn "镜像导入失败或停滞，尝试后备地址：$IMAGE_URL"
+    create_datavolume
+}
+
 # ===== 等待 DataVolume 导入完成 =====
 wait_for_datavolume() {
     _step "等待镜像导入完成..."
@@ -692,6 +880,7 @@ wait_for_datavolume() {
     local timeout=1800  # 30 分钟
     local elapsed=0
     local last_progress=""
+    local stagnant=0
 
     _info "正在下载并导入镜像，请耐心等待（可能需要 5-30 分钟，取决于网速）..."
 
@@ -713,6 +902,10 @@ wait_for_datavolume() {
             local message
             message=$(kubectl get datavolume "$DV_NAME" -n "$NS" \
                 -o jsonpath='{.status.conditions[*].message}' 2>/dev/null || echo "unknown error")
+            if next_image_import_source; then
+                elapsed=0; stagnant=0; last_progress=""
+                continue
+            fi
             cleanup_failed_vm_resources
             _error "镜像导入失败：$message\n请检查镜像 URL 是否可访问或磁盘空间是否充足"
         fi
@@ -720,14 +913,28 @@ wait_for_datavolume() {
         if [ "$progress" != "$last_progress" ] && [ -n "$progress" ]; then
             echo -e "\r  进度: ${YELLOW}${progress}${NC} (状态: ${phase})        "
             last_progress="$progress"
+            stagnant=0
         else
             echo -n "."
+            stagnant=$((stagnant + 5))
         fi
+        case "$IMAGE_URL" in
+            "${DUFS_MIRROR_BASE%/}/"*)
+                if [ "$stagnant" -ge "${DUFS_IMPORT_PRIMARY_IDLE_TIMEOUT:-120}" ] && next_image_import_source; then
+                    elapsed=0; stagnant=0; last_progress=""
+                    continue
+                fi
+                ;;
+        esac
 
         sleep 5
         elapsed=$((elapsed + 5))
         if [ "$elapsed" -ge "$timeout" ]; then
             echo ""
+            if next_image_import_source; then
+                elapsed=0; stagnant=0; last_progress=""
+                continue
+            fi
             cleanup_failed_vm_resources
             _error "镜像导入超时（${timeout}秒），请检查网络连接和磁盘空间"
         fi
@@ -779,6 +986,10 @@ wait_for_vmi() {
         elapsed=$((elapsed + 3))
         if [ "$elapsed" -ge "$timeout" ]; then
             echo ""
+            if next_image_import_source; then
+                elapsed=0; stagnant=0; last_progress=""
+                continue
+            fi
             cleanup_failed_vm_resources
             _error "虚拟机启动超时（${timeout}秒）\n尝试：kubectl describe vmi $VM_NAME -n $NS"
         fi
